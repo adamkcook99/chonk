@@ -1,0 +1,66 @@
+#version 450
+
+// 1 = filled pixel, 0 = empty pixel
+const int letterA[10][10] = int[10][10](
+    int[10](0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    int[10](0, 1, 1, 1, 1, 1, 1, 1, 1, 0),
+    int[10](1, 1, 0, 0, 0, 0, 0, 0, 1, 1),
+    int[10](1, 1, 0, 0, 0, 0, 0, 0, 1, 1),
+    int[10](1, 1, 0, 0, 0, 0, 0, 0, 1, 1),
+    int[10](1, 1, 1, 1, 1, 1, 1, 1, 1, 1),
+    int[10](1, 1, 0, 0, 0, 0, 0, 0, 1, 1),
+    int[10](1, 1, 0, 0, 0, 0, 0, 0, 1, 1),
+    int[10](1, 1, 0, 0, 0, 0, 0, 0, 1, 1),
+    int[10](1, 1, 0, 0, 0, 0, 0, 0, 1, 1));
+    
+// Storage image to write to (BGRA format to match swapchain)
+layout(set = 0, binding = 0, rgba8) uniform writeonly image2D outputImage;
+
+// Local size (workgroup size)
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+void main() {
+    // Get the global pixel coordinates
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    
+    // Get the image dimensions
+    ivec2 imageSize = imageSize(outputImage);
+
+    if (pixelCoord.x > imageSize.x && pixelCoord.y > imageSize.y) {
+        return;
+    }
+
+    ivec2 center = {100, 500};
+
+    // if pixel y is odd, write green
+    // if pixel y is even, write blue
+    if (pixelCoord.y % 2 == 0) {
+        imageStore(outputImage, pixelCoord, vec4(0.0, 1.0, 0.0, 1.0));
+    } else {
+        imageStore(outputImage, pixelCoord, vec4(0.0, 0.0, 1.0, 1.0));
+    }
+
+    // for radius of 128 in the center of the screen, write a circle with a radius of 128
+    if (distance(pixelCoord, center) <= 128) {
+        imageStore(outputImage, pixelCoord, vec4(1.0, 0.0, 0.0, 1.0));
+    }
+
+    // for radius of 64 in the center of the screen, write a circle with a radius of 64
+    if (distance(pixelCoord, center) <= 64) {
+        imageStore(outputImage, pixelCoord, vec4(0.0, 1.0, 0.0, 1.0));
+    }
+
+    // for radius of 32 in the center of the screen, write a circle with a radius of 32
+    if (distance(pixelCoord, center) <= 32) {
+        imageStore(outputImage, pixelCoord, vec4(0.0, 0.0, 1.0, 1.0));
+    }
+
+    ivec2 corner = ivec2(100, 50); // top-left corner of shape in the image
+    ivec2 rel = pixelCoord - corner; // relative position inside the shape
+
+    if (rel.x >= 0 && rel.y >= 0 && rel.x < 10 && rel.y < 10) {
+        if (letterA[rel.y][rel.x] == 1) {
+            imageStore(outputImage, pixelCoord, vec4(1.0, 0.0, 0.0, 1.0));
+        }
+    }
+}

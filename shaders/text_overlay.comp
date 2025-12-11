@@ -1,0 +1,214 @@
+#version 450
+
+// Input: raytraced image
+layout(set = 0, binding = 0, rgba8) uniform readonly image2D inputImage;
+// Output: composited image (same as input for overlay)
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D outputImage;
+
+// Font texture - 128x128, 16x16 grid of 8x8 characters
+layout(set = 0, binding = 2) uniform sampler2D fontTexture;
+
+// Debug info uniform
+layout(set = 0, binding = 3) uniform DebugInfo {
+    vec4 cameraPos;          // xyz = position, w = unused
+    float fps;               // FPS value
+    float textScale;         // Scale factor for text (1.0 = 8x8, 2.0 = 16x16, etc.)
+    uint textEnabled;         // 1 = show text, 0 = hide
+    uint crosshairEnabled;    // 1 = show crosshair, 0 = hide
+    uint _pad1;
+    uint _pad2;
+} debugInfo;
+
+// Text buffer - array of text entries
+// Must match C++ struct with std430 alignment (24 bytes per entry)
+struct TextEntry {
+    ivec2 position;       // 8 bytes - Screen position (x, y)
+    uint charCount;       // 4 bytes - Number of characters
+    uint charStartIndex;  // 4 bytes - Starting index in charBuffer
+    uint _pad1;           // 4 bytes
+    uint _pad2;           // 4 bytes (total 24 bytes for 8-byte alignment)
+};
+
+layout(set = 0, binding = 4) readonly buffer TextBuffer {
+    uint entryCount;
+    uint _bufferPad;      // Padding to align entries to 8 bytes
+    TextEntry entries[];
+} textBuffer;
+
+// Character data - each entry is a character code (ASCII)
+layout(set = 0, binding = 5) readonly buffer CharBuffer {
+    uint chars[];
+} charBuffer;
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Character mapping function - maps ASCII to font grid position
+// Returns (row, col) in the 16x16 grid, or (-1, -1) if not found
+ivec2 getCharGridPos(int charCode) {
+    // Lowercase a-z: rows 0-1
+    if (charCode >= 97 && charCode <= 122) {  // 'a' to 'z'
+        int index = charCode - 97;
+        int row = index / 16;
+        int col = index % 16;
+        return ivec2(col, row);
+    }
+    // Uppercase A-Z: rows 2-3
+    else if (charCode >= 65 && charCode <= 90) {  // 'A' to 'Z'
+        int index = charCode - 65;
+        int row = (index / 16) + 2;
+        int col = index % 16;
+        return ivec2(col, row);
+    }
+    // Digits 0-9: row 4
+    else if (charCode >= 48 && charCode <= 57) {  // '0' to '9'
+        int index = charCode - 48;
+        return ivec2(index, 4);
+    }
+    // Symbols: row 5
+    else if (charCode == 43) return ivec2(0, 5);   // '+'
+    else if (charCode == 45) return ivec2(1, 5);   // '-'
+    else if (charCode == 61) return ivec2(2, 5);   // '='
+    else if (charCode == 40) return ivec2(3, 5);   // '('
+    else if (charCode == 41) return ivec2(4, 5);   // ')'
+    else if (charCode == 91) return ivec2(5, 5);   // '['
+    else if (charCode == 93) return ivec2(6, 5);   // ']'
+    else if (charCode == 123) return ivec2(7, 5);  // '{'
+    else if (charCode == 125) return ivec2(8, 5);  // '}'
+    else if (charCode == 60) return ivec2(9, 5);   // '<'
+    else if (charCode == 62) return ivec2(10, 5); // '>'
+    else if (charCode == 47) return ivec2(11, 5); // '/'
+    else if (charCode == 42) return ivec2(12, 5); // '*'
+    else if (charCode == 35) return ivec2(13, 5); // '#'
+    else if (charCode == 37) return ivec2(14, 5); // '%'
+    else if (charCode == 33) return ivec2(15, 5); // '!'
+    // Symbols: row 6
+    else if (charCode == 63) return ivec2(0, 6);  // '?'
+    else if (charCode == 46) return ivec2(1, 6);  // '.'
+    else if (charCode == 44) return ivec2(2, 6);  // ','
+    else if (charCode == 39) return ivec2(3, 6);  // '''
+    else if (charCode == 34) return ivec2(4, 6);  // '"'
+    else if (charCode == 64) return ivec2(5, 6);  // '@'
+    else if (charCode == 38) return ivec2(6, 6);  // '&'
+    else if (charCode == 36) return ivec2(7, 6);  // '$'
+    // Space (32) - return invalid
+    else if (charCode == 32) return ivec2(-1, -1); // Space - skip
+    // Colon and semicolon (not in your list, but common)
+    else if (charCode == 58) return ivec2(8, 6);  // ':' (if you add it)
+    else if (charCode == 59) return ivec2(9, 6);  // ';' (if you add it)
+    
+    return ivec2(-1, -1); // Not found
+}
+
+// Sample a character from the font texture
+// charCode: ASCII character code
+// pixelInChar: pixel position within the character (0-7 for 8x8, scaled)
+vec4 sampleChar(int charCode, ivec2 pixelInChar, float scale) {
+    ivec2 gridPos = getCharGridPos(charCode);
+    if (gridPos.x < 0 || gridPos.y < 0) {
+        return vec4(0.0); // Invalid character or space
+    }
+    
+    // Each character is 8x8 pixels in the 128x128 texture
+    // Grid is 16x16, so each cell is 8x8 pixels
+    // pixelInChar is already in 0-7 range (scaled down in main function)
+    vec2 charUV = vec2(
+        (float(gridPos.x) * 8.0 + float(pixelInChar.x) + 0.5) / 128.0,
+        (float(gridPos.y) * 8.0 + float(pixelInChar.y) + 0.5) / 128.0
+    );
+    
+    return texture(fontTexture, charUV);
+}
+
+// Draw crosshair
+vec4 drawCrosshair(ivec2 pixelCoord, ivec2 imageSize) {
+    ivec2 center = imageSize / 2;
+    int size = 12;
+    int thickness = 2;
+    
+    // Horizontal line
+    if (abs(pixelCoord.y - center.y) < thickness && 
+        abs(pixelCoord.x - center.x) < size) {
+        return vec4(1.0, 1.0, 1.0, 1.0);
+    }
+    // Vertical line
+    if (abs(pixelCoord.x - center.x) < thickness && 
+        abs(pixelCoord.y - center.y) < size) {
+        return vec4(1.0, 1.0, 1.0, 1.0);
+    }
+    
+    return vec4(0.0);
+}
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imageSize = imageSize(outputImage);
+    
+    if (pixelCoord.x >= imageSize.x || pixelCoord.y >= imageSize.y) {
+        return;
+    }
+    
+    // Read raytraced image
+    vec4 color = imageLoad(inputImage, pixelCoord);
+    
+    // Draw crosshair
+    if (debugInfo.crosshairEnabled == 1u) {
+        vec4 crosshair = drawCrosshair(pixelCoord, imageSize);
+        if (crosshair.a > 0.0) {
+            color.rgb = mix(color.rgb, crosshair.rgb, 0.8);
+        }
+    }
+    
+    // Draw text overlay
+    if (debugInfo.textEnabled == 1u) {
+        float scale = debugInfo.textScale;
+        int charSize = int(8.0 * scale);
+        
+        // Iterate through all text entries
+        for (uint i = 0u; i < textBuffer.entryCount; i++) {
+            TextEntry entry = textBuffer.entries[i];
+            ivec2 textPos = entry.position;
+            
+            // Check if this pixel is within the text bounds
+            ivec2 relativePos = pixelCoord - textPos;
+            
+            // Check if pixel is within the text area (x: 0 to charCount*charSize, y: 0 to charSize)
+            if (relativePos.x >= 0 && relativePos.x < int(entry.charCount) * charSize &&
+                relativePos.y >= 0 && relativePos.y < charSize) {
+                
+                // Find which character this pixel belongs to
+                int charIndex = relativePos.x / charSize;
+                
+                if (charIndex >= 0 && charIndex < int(entry.charCount)) {
+                    // Calculate position within the character (0 to charSize-1)
+                    int charLocalX = relativePos.x - (charIndex * charSize);
+                    int charLocalY = relativePos.y;
+                    
+                    // Get character code from buffer using entry's start index
+                    uint charBufferIndex = entry.charStartIndex + uint(charIndex);
+                    if (charBufferIndex < charBuffer.chars.length()) {
+                        int charCode = int(charBuffer.chars[charBufferIndex]);
+                        
+                        // Sample character at scaled position (convert back to 8x8 space)
+                        ivec2 charPixelPos = ivec2(
+                            int(float(charLocalX) / scale),
+                            int(float(charLocalY) / scale)
+                        );
+                        
+                        // Make sure we're within the 8x8 character bounds
+                        if (charPixelPos.x >= 0 && charPixelPos.x < 8 &&
+                            charPixelPos.y >= 0 && charPixelPos.y < 8) {
+                            vec4 charColor = sampleChar(charCode, charPixelPos, scale);
+                            if (charColor.a > 0.1) {
+                                // Composite text over background
+                                color.rgb = mix(color.rgb, charColor.rgb, charColor.a);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    imageStore(outputImage, pixelCoord, color);
+}
+

@@ -1,0 +1,171 @@
+
+
+DO NOT EDIT ANYTHING IS THIS FOLDER OR FILE. THIS IS YOUR BIBLE. 
+Everything should be based on this and determined by me.
+
+CHONK is a voxel game with:
+
+Multiplayer
+Realistic Lighting
+Realisting Physics
+Infinite world
+Practically infinite view distance
+
+## Chunks
+
+Each block is 0.25 meters. Each chunk is 64^3 blocks or 16 meters^3
+The world is infinite. This is achieved by dynamically loading in and out chunks around the player.
+
+Chunks are not all the same size. The chunks right around a player are full resolution with the size of 0.25 meters. Slighty more chunks are rendered at this resolution in a 5x5 grid with the player at the center. But then each ring beyond that of chunk is 4 times bigger than the last. Chunk size progression is as follows:
+
+2.5 chunks at 0.25 resolution or 40 meters across (8 + 16 + 16)
+1 meter resolution with each chunk being 64 meters across
+4 meter resolution with each chunk being 256 meters across
+16 meter resolution with each chunk being 1024 meters across
+64 meter resolution with each chunk being 4096 meters across
+
+The render distance is a square around the player with them at the center. This makes view distance 
+
+4096+1024+256+64+16+16+8 = 5480
+
+The render distance is 13^3 or 2197 chunks. This means there is half of this in front of them if they are in the center of the chunk. 
+The simulation distance is a cube that is 5^3 or 125 chunks with the player in the center.
+
+This means the seeable simulation distance is 2 and a half chunks or 40 meters and the total view distance is 5480. This also means the world is 10,960 meters from top to bottom.
+
+## World
+
+The world is infinite. Chunks are dynamically loaded into CPU memory and sent to the GPU as needed. When a chunk is no longer needed it is saved to file. Lazy loading helps us load in and out chunks.
+
+## Data Structures
+
+Chunks are each stored as a chunk object that uses sparse voxel octree to represent the block data. In addition to the SVO we have a flat array for children. Each SVO node is
+
+```
+struct Node {
+    uint32_t childBase;  // index of first child in a compact child array
+    uint8_t  childMask;  // 8 bits: which children exist (0 == leaf)
+    uint8_t  material;   // material if leaf (or dominant material)
+    uint16_t padding;    // alignment (optional)
+};
+
+// with the flat child array we can index with
+child = nodes[node.child_index[i]];
+
+```
+
+Each chunk has an AABB, visible boolean (that means it isn't fully air or enclosed by other full chunks), position of the chunk in the world and the SVO.
+
+The SVO allows for really fast ray intersection and efficient block storage and compression. 
+
+Chunks are stored in a standard array. Given that there are only 2197 chunks iterating and indexing should be plenty quick, plus we can skip over everything that isn't visible. We will only send visible chunks within the frustum to the gpu to save on ray tracing iteration.
+
+Chunks and SVOs should be packed and only contain necessary information. This will help keep VRAM low and allow us to send data to the GPU with little modification.
+
+## Materials
+
+For now we use a uint8 to represent a material. 
+
+0 is air
+1 is grass
+2 is dirt
+3 is stone
+
+## Rendering
+
+The game is rendered with MoltenVK (for now we only need to work on MacOS)
+We use a compute shader to implement a custom ray tracing solution.
+The compute shader shoots a ray from every pixel on the screen, iterates over the culled chunk list to find which chunk it intersects with, then walks down the svo to find the smallest node that it intersects with. From there we do 
+
+1 ray for shadows
+1 ray for light sources (for now just the sun)
+1 random ray for indirect lighting
+
+We add up and save the pixel value and we do this for every pixel.
+
+The render distance is 2197 chunks which can all exist in memory on the cpu and only necessary Chunks are sent to the GPU. All of these chunks is only is 575,930,368 blocks/nodes. Chunks will need to be dynamically loaded and unloaded.
+
+We won't worry about textures for now. We can just use simple colors.
+
+0 is air which is empty
+1 is grass which is green
+2 is dirt which is brown
+3 is stone which is grey
+
+## Multiplayer
+
+The server keeps the definitive copy of the world, does chunk loading and unloading from file and alerts all players of updates. Chunk loading and unloading should be asyncronous and loaded/rendered as they are ready.
+
+The client keeps its own copy of the world and gives the server updates on player movement and interaction.
+
+The server only maintains the simulation distance which is the center 5x5x5 region at full resolution. This way the server only maintains 125 chunks per active player. As the player moves it will need to generate the chunk at the correct resolution and send it to the player and then drop it from CPU memory. 
+
+Eventually the server with do physics and the client will do physics prediction but we won't worry for now.
+
+We also don't need to worry about single player. We can use the server/client paradigm for everything and for single player we can just keep anyone else from joining. 
+
+Lets use ENet for simplicty.
+
+## Physics
+
+I plan on using Bullet physics to add physics to the game, such as gravity, collisions, things falling over and collapsing but only want you to be aware of it for now and will integrate in the future.
+
+Ideally blocks will enter a active state when physics are being calculated for them at a certain frequency but once velocity gets below a certain threshold they will return to the voxel grid and be saved to the SVO. For example, when a tree is cut down, it will fall over but once it comes to its resting state it will return to the voxel grid and no longer be physically active. 
+
+Physics will only be calculated within the simulation distance of each player.
+
+## Entities
+
+Players, monsters, animals, items, vehicles, drops, plants will be added at some point in the future.
+
+## World Generation
+
+For now we can do super simple world generation. The world is 10,960 meters from top to bottom.
+
+We can put stone from the bottom to 5440, then dirt to 5487 and one layer of grass on top. Everything above this will be air.
+
+We will need to render differenet resolutions depending on the chunk. A super simple alogrithm would be that if the first block has something other than air, make everything that same material. 
+
+
+## File Structure and Complilation 
+
+There should be a clean divide between client and server as well as game engine and game. 
+
+Lets use CMake to build and compile everything. Here is my proposed file structure
+
+CHONK/
+├── CMakeLists.txt               # Root CMake build file
+├── README.md
+├── documentation/               # Design docs, API references, research notes
+├── external/                    # Third-party libraries (Bullet, GLFW, MoltenVK, etc.)
+├── engine/                      # Core engine code (independent of game logic)
+│   ├── CMakeLists.txt
+│   ├── graphics/                # Rendering, compute shaders
+│   ├── voxels/                  # Chunk, SVO, voxel storage
+│   ├── physics/                 # Physics integration with Bullet
+│   ├── math/                    # Vector/matrix math, utility math functions
+│   ├── networking/              # Client-server networking logic
+│   └── core/                    # Core utilities: memory, logging, threading
+├── game/                        # Game-specific logic
+│   ├── CMakeLists.txt
+│   ├── world/                   # World gen, procedural generation, biomes
+│   ├── entities/                # Players, monsters, items, vehicles, etc.
+│   ├── gameplay/                # Game rules, interactions
+│   └── ui/                      # HUD, menus, text rendering
+├── client/                      # Client-specific entry point
+│   ├── CMakeLists.txt
+│   └── main.cpp                  # Starts engine in client mode
+├── server/                      # Server-specific entry point
+│   ├── CMakeLists.txt
+│   └── main.cpp                  # Starts engine in server mode
+├── shaders/                     # Compute / fragment / vertex shaders
+├── tools/                       # Utility tools (chunk viewer, voxel editor)
+└── tests/                       # Unit tests, integration tests
+
+
+## Coordinates
+
+Lets have world coordinates that are each 0.25 step. So three uint32 for x,y,z. We will use floats relative to the players active chunk for other coordinate needs.
+
+
+
