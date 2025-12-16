@@ -149,7 +149,7 @@ private:
     void allocateCommandBuffers();
     void createSyncObjects();
     void createUniformBuffer();
-    void createChunkBuffers(const std::vector<const voxels::Chunk*>& chunks);
+    void createChunkBuffers(const std::vector<const voxels::Chunk*>& chunks, const math::Vec3& cameraPos);
     void updateUniformBuffer(const math::Vec3& cameraPos, const math::Vec3& cameraDir, const math::Vec3& cameraUp);
     
     // Text overlay methods

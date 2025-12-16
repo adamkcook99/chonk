@@ -1,6 +1,7 @@
 #include "renderer.h"
 #include "../voxels/chunk.h"
 #include "../voxels/svo.h"
+#include "../voxels/world_constants.h"
 #include "../math/vec3.h"
 #include "../core/logging.h"
 #include <fstream>
@@ -660,7 +661,7 @@ void Renderer::createSyncObjects() {
     }
 }
 
-void Renderer::createChunkBuffers(const std::vector<const voxels::Chunk*>& chunks) {
+void Renderer::createChunkBuffers(const std::vector<const voxels::Chunk*>& chunks, const math::Vec3& cameraPos) {
     // Destroy old buffers if they exist (but only chunk buffers, not uniform buffer)
     if (chunkDataBufferMemory != VK_NULL_HANDLE) {
         vkFreeMemory(device, chunkDataBufferMemory, nullptr);
@@ -859,13 +860,13 @@ void Renderer::createChunkBuffers(const std::vector<const voxels::Chunk*>& chunk
         vkUnmapMemory(device, chunkDataBufferMemory);
     }
     
-    // Create chunk info buffer
+    // Create chunk info buffer - must match shader struct
     struct ChunkInfo {
-        float aabbMin[4];
-        float aabbMax[4];
+        float aabbMin[4];   // xyz = min, w = unused
+        float aabbMax[4];   // xyz = max, w = chunk size
         uint32_t nodeOffset;
         uint32_t nodeCount;
-        uint32_t visible;
+        uint32_t maxDepth;  // LOD depth for this chunk
         uint32_t padding;
     };
     
@@ -877,14 +878,19 @@ void Renderer::createChunkBuffers(const std::vector<const voxels::Chunk*>& chunk
         info.aabbMin[0] = aabb.min.x;
         info.aabbMin[1] = aabb.min.y;
         info.aabbMin[2] = aabb.min.z;
-        info.aabbMin[3] = chunk->getResolution();
+        info.aabbMin[3] = 0.0f;  // Unused
         info.aabbMax[0] = aabb.max.x;
         info.aabbMax[1] = aabb.max.y;
         info.aabbMax[2] = aabb.max.z;
-        info.aabbMax[3] = chunk->getSize();
+        info.aabbMax[3] = voxels::CHUNK_SIZE_METERS;  // 256.0f
         info.nodeOffset = nodeOffsets[i];
         info.nodeCount = static_cast<uint32_t>(chunk->getSVO().getNodeCount());
-        info.visible = 1; // All chunks passed to renderer are visible (already filtered)
+        
+        // Calculate LOD depth based on distance from camera
+        math::Vec3 chunkCenter = aabb.getCenter();
+        float distance = (chunkCenter - cameraPos).length();
+        info.maxDepth = voxels::getMaxDepthForDistance(distance);
+        
         info.padding = 0;
         chunkInfos.push_back(info);
     }
@@ -1076,7 +1082,7 @@ void Renderer::render(const std::vector<const voxels::Chunk*>& chunks,
     }
     
     if (chunks.size() != lastChunkCount || totalNodes != lastTotalNodes) {
-        createChunkBuffers(chunks);
+        createChunkBuffers(chunks, cameraPos);
         lastChunkCount = chunks.size();
         lastTotalNodes = totalNodes;
     }

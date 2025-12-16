@@ -28,8 +28,8 @@ enum class MessageType : uint8_t {
 struct ChunkDataHeader {
     MessageType type;
     int32_t x, y, z;
-    uint8_t resolution;
     uint32_t nodeCount;
+    uint32_t maxDepth;  // LOD depth for this chunk
     // Followed by node data
 };
 
@@ -41,7 +41,6 @@ struct PlayerPositionMessage {
 struct ChunkRequestMessage {
     MessageType type;
     int32_t x, y, z;
-    uint8_t resolution;
 };
 
 class NetworkManager {

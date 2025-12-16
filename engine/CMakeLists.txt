@@ -11,9 +11,12 @@ add_library(engine_voxels
     voxels/svo.cpp
     voxels/chunk.cpp
     voxels/chunk_manager.cpp
+    voxels/super_chunk.cpp
     voxels/svo.h
     voxels/chunk.h
     voxels/chunk_manager.h
+    voxels/super_chunk.h
+    voxels/world_constants.h
 )
 
 target_link_libraries(engine_voxels PRIVATE engine_math)

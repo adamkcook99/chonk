@@ -1,46 +1,17 @@
 #include "chunk_manager.h"
+#include "world_constants.h"
 #include "../../game/world/world_generator.h"
 #include "../networking/network.h"
 #include "../core/logging.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 
 namespace chonk {
 namespace voxels {
 
-// Precomputed grid offsets from anchor point (corner of grid position 7)
-static const float GRID_OFFSETS[18] = {
-    -4064.0f, // pos 0: layer 7 (2048m)
-    -2016.0f, // pos 1: layer 6 (1024m)
-    -992.0f,  // pos 2: layer 5 (512m)
-    -480.0f,  // pos 3: layer 4 (256m)
-    -224.0f,  // pos 4: layer 3 (128m)
-    -96.0f,   // pos 5: layer 2 (64m)
-    -32.0f,   // pos 6: layer 1 (32m)
-    0.0f,     // pos 7: layer 0 (16m) - anchor
-    16.0f,    // pos 8: layer 0 (16m)
-    32.0f,    // pos 9: layer 0 (16m)
-    48.0f,    // pos 10: layer 0 (16m)
-    64.0f,    // pos 11: layer 1 (32m)
-    96.0f,    // pos 12: layer 2 (64m)
-    160.0f,   // pos 13: layer 3 (128m)
-    288.0f,   // pos 14: layer 4 (256m)
-    544.0f,   // pos 15: layer 5 (512m)
-    1056.0f,  // pos 16: layer 6 (1024m)
-    2080.0f   // pos 17: layer 7 (2048m)
-};
-
-// Layer for each grid position
-static const int GRID_LAYERS[18] = {7, 6, 5, 4, 3, 2, 1, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7};
-
-ChunkManager::ChunkManager() 
-    : worldGenerator(nullptr)
-    , running(false)
-    , chunkDirectory("chunks")
-    , anchorPos(0, 0, 0)
-    , playerChunk(0, 0, 0, ChunkResolution::RES_0_25M)
-    , anchorInitialized(false) {
+ChunkManager::ChunkManager() : superChunkCache(TOTAL_SUPER_CHUNKS + 25) {
 }
 
 ChunkManager::~ChunkManager() {
@@ -50,328 +21,240 @@ ChunkManager::~ChunkManager() {
 void ChunkManager::initialize(game::world::WorldGenerator* generator) {
     worldGenerator = generator;
     running = true;
-    loadThread = std::thread(&ChunkManager::loadThreadFunc, this);
+    
+    // Start multiple load threads for faster chunk generation
+    for (int i = 0; i < NUM_LOAD_THREADS; ++i) {
+        loadThreads.emplace_back(&ChunkManager::loadThreadFunc, this);
+    }
+    refineThread = std::thread(&ChunkManager::refineThreadFunc, this);
+    
+    LOG_INFO("ChunkManager initialized with " + std::to_string(NUM_LOAD_THREADS) + " load threads");
 }
 
 void ChunkManager::shutdown() {
     if (running) {
         running = false;
         loadCondition.notify_all();
-        if (loadThread.joinable()) {
-            loadThread.join();
+        refineCondition.notify_all();
+        
+        for (auto& thread : loadThreads) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+        loadThreads.clear();
+        
+        if (refineThread.joinable()) {
+            refineThread.join();
         }
     }
     
     // Save all chunks
-    std::lock_guard<std::mutex> lock(chunksMutex);
-    for (auto& pair : chunks) {
-        if (pair.second && pair.second->isLoaded()) {
-            std::string filename = getChunkFilename(pair.first);
-            pair.second->saveToFile(filename);
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    for (auto* super : superChunkCache.getAll()) {
+        std::string superDir = getSuperChunkDirectory(super->getCoord());
+        std::filesystem::create_directories(superDir);
+        
+        for (auto* chunk : super->getLoadedChunks()) {
+            std::string filename = getChunkFilename(chunk->getCoord());
+            chunk->saveToFile(filename);
         }
     }
-    chunks.clear();
 }
 
-void ChunkManager::update(const math::Vec3& playerPos) {
-    // Update anchor position if player moved outside 2x2x2 center
-    updateAnchorIfNeeded(playerPos);
+uint32_t ChunkManager::calculateTargetDepth(const ChunkCoord& coord, const math::Vec3& playerPos) const {
+    math::Vec3 chunkCenter = coord.toWorldPos() + 
+                              math::Vec3(CHUNK_SIZE_METERS * 0.5f, 
+                                         CHUNK_SIZE_METERS * 0.5f, 
+                                         CHUNK_SIZE_METERS * 0.5f);
+    float distance = (chunkCenter - playerPos).length();
     
-    // Get all required chunks for current position
-    std::vector<ChunkCoord> required = getRequiredChunks(playerPos);
+    // Get render depth and add 1 for buffer
+    uint32_t renderDepth = getMaxDepthForDistance(distance);
+    return std::min(renderDepth + 1, CHUNK_SVO_DEPTH);
+}
+
+void ChunkManager::update(const math::Vec3& playerPos, uint32_t frame) {
+    currentFrame = frame;
+    lastPlayerPos = playerPos;
     
-    // Queue chunks that need loading
+    SuperChunkCoord playerSuperCoord = SuperChunkCoord::fromWorldPos(playerPos);
+    
+    // Get required super chunks (5x5x5 around player)
+    std::vector<SuperChunkCoord> requiredSupers = getRequiredSuperChunks(playerPos);
+    
     {
-        std::lock_guard<std::mutex> lock(loadQueueMutex);
-        for (const auto& coord : required) {
-            // Skip if already loaded or pending
-            if (pendingLoads.find(coord) != pendingLoads.end()) {
-                continue;
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        
+        // Ensure all required super chunks exist
+        for (const auto& superCoord : requiredSupers) {
+            SuperChunk* super = getOrCreateSuperChunk(superCoord);
+            if (super) {
+                superChunkCache.touch(superCoord, frame);
             }
-            
-            {
-                std::lock_guard<std::mutex> chunkLock(chunksMutex);
-                auto it = chunks.find(coord);
-                if (it != chunks.end() && it->second->isLoaded()) {
-                    continue;
-                }
-            }
-            
-            // Queue with priority based on distance
-            float priority = calculateLoadPriority(coord, playerPos);
-            queueChunkLoad(coord, priority);
-                }
-            }
-            
-    // Notify load thread
-    loadCondition.notify_one();
+        }
+    }
     
-    // Unload chunks no longer needed
-    unloadDistantChunks(playerPos);
+    // Queue chunks for loading and refinement
+    {
+        std::lock_guard<std::mutex> queueLock(loadQueueMutex);
+        std::lock_guard<std::mutex> refineLock(refineQueueMutex);
+        
+        for (const auto& superCoord : requiredSupers) {
+            std::vector<ChunkCoord> neededChunks = getRequiredChunksInSuper(superCoord, playerPos);
+            
+            for (const auto& chunkCoord : neededChunks) {
+                float priority = calculateLoadPriority(chunkCoord, playerPos);
+                uint32_t targetDepth = calculateTargetDepth(chunkCoord, playerPos);
+                
+                // Check if already loaded
+                Chunk* existingChunk = nullptr;
+                {
+                    std::lock_guard<std::mutex> cacheLock(cacheMutex);
+                    SuperChunk* super = superChunkCache.get(superCoord);
+                    if (super) {
+                        ChunkCoord first = superCoord.getFirstChunkCoord();
+                        uint32_t lx = chunkCoord.x - first.x;
+                        uint32_t ly = chunkCoord.y - first.y;
+                        uint32_t lz = chunkCoord.z - first.z;
+                        existingChunk = super->getChunk(lx, ly, lz);
+                    }
+                }
+                
+                if (existingChunk) {
+                    // Chunk exists - check if it needs refinement
+                    if (existingChunk->hasMoreDetail() && 
+                        existingChunk->getCurrentDepth() < targetDepth &&
+                        pendingRefines.find(chunkCoord) == pendingRefines.end()) {
+                        queueChunkRefine(chunkCoord, superCoord, targetDepth, priority);
+                    }
+                } else {
+                    // Chunk doesn't exist - queue for loading
+                    if (pendingLoads.find(chunkCoord) == pendingLoads.end()) {
+                        queueChunkLoad(chunkCoord, superCoord, targetDepth, priority);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Log queue sizes periodically
+    static uint32_t updateCount = 0;
+    updateCount++;
+    if (updateCount == 1 || updateCount % 500 == 0) {
+        std::lock_guard<std::mutex> queueLock2(loadQueueMutex);
+        LOG_INFO("Update " + std::to_string(updateCount) + 
+                 ": " + std::to_string(pendingLoads.size()) + " pending loads");
+    }
+    
+    loadCondition.notify_all();  // Wake all load threads
+    refineCondition.notify_one();
+    lastPlayerSuperChunk = playerSuperCoord;
 }
 
-void ChunkManager::updateAnchorIfNeeded(const math::Vec3& playerPos) {
-    ChunkCoord newPlayerChunk = worldToChunkCoord(playerPos, ChunkResolution::RES_0_25M);
+std::vector<SuperChunkCoord> ChunkManager::getRequiredSuperChunks(const math::Vec3& playerPos) const {
+    std::vector<SuperChunkCoord> result;
+    SuperChunkCoord center = SuperChunkCoord::fromWorldPos(playerPos);
+
+    // Keep current horizontal radius (e.g., 5×5 if SUPER_CHUNKS_PER_AXIS=5)
+    int radius = SUPER_CHUNKS_PER_AXIS / 2; // was 2 for 5x5
+
+    // Vertical: one layer below the player, the player layer, and all above up to the top
+    int minY = std::max(0, center.y - 1);
+    int maxY = static_cast<int>(WORLD_HEIGHT_METERS / SUPER_CHUNK_SIZE_METERS) - 1; // e.g., 4 for 10240/2048
+
+    for (int y = minY; y <= maxY; ++y) {
+        for (int dz = -radius; dz <= radius; ++dz) {
+            for (int dx = -radius; dx <= radius; ++dx) {
+                result.push_back(SuperChunkCoord(center.x + dx, y, center.z + dz));
+            }
+        }
+    }
+    return result;
+}
+
+std::vector<ChunkCoord> ChunkManager::getRequiredChunksInSuper(const SuperChunkCoord& superCoord, 
+                                                               const math::Vec3& playerPos) const {
+    std::vector<ChunkCoord> result;
     
-    if (!anchorInitialized) {
-        // First time: position anchor so player is in center of 4x4x4
-        playerChunk = newPlayerChunk;
-        anchorPos = math::Vec3(
-            (playerChunk.x - 1) * 16.0f,
-            (playerChunk.y - 1) * 16.0f,
-            (playerChunk.z - 1) * 16.0f
-        );
-        anchorInitialized = true;
-        LOG_INFO("Initialized anchor at (" + std::to_string(anchorPos.x) + ", " +
-                 std::to_string(anchorPos.y) + ", " + std::to_string(anchorPos.z) + ")");
-        return;
+    ChunkCoord first = superCoord.getFirstChunkCoord();
+    
+    for (uint32_t z = 0; z < CHUNKS_PER_SUPER_AXIS; ++z) {
+        for (uint32_t y = 0; y < CHUNKS_PER_SUPER_AXIS; ++y) {
+            for (uint32_t x = 0; x < CHUNKS_PER_SUPER_AXIS; ++x) {
+                ChunkCoord coord(first.x + x, first.y + y, first.z + z);
+                
+                math::Vec3 chunkCenter = coord.toWorldPos() + 
+                                          math::Vec3(CHUNK_SIZE_METERS * 0.5f, 
+                                                     CHUNK_SIZE_METERS * 0.5f, 
+                                                     CHUNK_SIZE_METERS * 0.5f);
+                float dist = (chunkCenter - playerPos).length();
+                
+                if (dist <= VIEW_DISTANCE_METERS) {
+                    result.push_back(coord);
+                }
+            }
+        }
     }
     
-    // Check if player moved to a different chunk
-    if (newPlayerChunk.x == playerChunk.x && 
-        newPlayerChunk.y == playerChunk.y && 
-        newPlayerChunk.z == playerChunk.z) {
-        return;  // Still in same chunk
+    return result;
+}
+
+SuperChunk* ChunkManager::getOrCreateSuperChunk(const SuperChunkCoord& coord) {
+    SuperChunk* existing = superChunkCache.get(coord);
+    if (existing) {
+        return existing;
     }
     
-    // Calculate player's position within the 4x4x4 center (grid positions 7-10)
-    // Anchor is at grid position 7, so relative position is:
-    int relX = newPlayerChunk.x - static_cast<int32_t>(anchorPos.x / 16.0f);
-    int relY = newPlayerChunk.y - static_cast<int32_t>(anchorPos.y / 16.0f);
-    int relZ = newPlayerChunk.z - static_cast<int32_t>(anchorPos.z / 16.0f);
+    auto newSuper = std::make_unique<SuperChunk>(coord);
+    SuperChunk* ptr = newSuper.get();
+    superChunkCache.add(std::move(newSuper));
     
-    // Player should stay in the center 2x2x2 of the 4x4x4 (positions 1,2 relative)
-    // If they move outside, shift the anchor
-    bool needsShift = false;
-    int shiftX = 0, shiftY = 0, shiftZ = 0;
-    
-    if (relX < 1) { shiftX = relX - 1; needsShift = true; }
-    else if (relX > 2) { shiftX = relX - 2; needsShift = true; }
-    
-    if (relY < 1) { shiftY = relY - 1; needsShift = true; }
-    else if (relY > 2) { shiftY = relY - 2; needsShift = true; }
-    
-    if (relZ < 1) { shiftZ = relZ - 1; needsShift = true; }
-    else if (relZ > 2) { shiftZ = relZ - 2; needsShift = true; }
-    
-    if (needsShift) {
-        anchorPos.x += shiftX * 16.0f;
-        anchorPos.y += shiftY * 16.0f;
-        anchorPos.z += shiftZ * 16.0f;
-        LOG_INFO("Shifted anchor by (" + std::to_string(shiftX) + ", " +
-                 std::to_string(shiftY) + ", " + std::to_string(shiftZ) + 
-                 ") to (" + std::to_string(anchorPos.x) + ", " +
-                 std::to_string(anchorPos.y) + ", " + std::to_string(anchorPos.z) + ")");
-    }
-    
-    playerChunk = newPlayerChunk;
+    return ptr;
 }
 
 float ChunkManager::calculateLoadPriority(const ChunkCoord& coord, const math::Vec3& playerPos) const {
-    // Priority based on world-space distance from player
-    float chunkSize = getChunkSizeForResolution(coord.resolution);
-    float chunkCenterX = coord.x * chunkSize + chunkSize * 0.5f;
-    float chunkCenterY = coord.y * chunkSize + chunkSize * 0.5f;
-    float chunkCenterZ = coord.z * chunkSize + chunkSize * 0.5f;
-    
-    float dx = chunkCenterX - playerPos.x;
-    float dy = chunkCenterY - playerPos.y;
-    float dz = chunkCenterZ - playerPos.z;
-    
-    // Also prioritize higher resolution chunks
-    float resolutionBonus = static_cast<float>(coord.resolution) * 100.0f;
-    
-    return std::sqrt(dx*dx + dy*dy + dz*dz) + resolutionBonus;
+    math::Vec3 chunkCenter = coord.toWorldPos() + 
+                              math::Vec3(CHUNK_SIZE_METERS * 0.5f, 
+                                         CHUNK_SIZE_METERS * 0.5f, 
+                                         CHUNK_SIZE_METERS * 0.5f);
+    return (chunkCenter - playerPos).length();
 }
 
-void ChunkManager::queueChunkLoad(const ChunkCoord& coord, float priority) {
-    // Called with loadQueueMutex held
+void ChunkManager::queueChunkLoad(const ChunkCoord& coord, const SuperChunkCoord& superCoord, 
+                                   uint32_t targetDepth, float priority) {
     if (pendingLoads.find(coord) != pendingLoads.end()) {
-        return;  // Already in queue
+        return;
     }
     
-    loadQueue.push({coord, priority});
+    // Limit queue size to prevent memory issues
+    if (pendingLoads.size() >= 500) {
+        return;  // Skip, will be queued on next update
+    }
+    
+    loadQueue.push({coord, superCoord, targetDepth, priority});
     pendingLoads.insert(coord);
 }
 
-Chunk* ChunkManager::getChunk(const ChunkCoord& coord) {
-    std::lock_guard<std::mutex> lock(chunksMutex);
-    auto it = chunks.find(coord);
-    if (it != chunks.end()) {
-        return it->second.get();
-    }
-    return nullptr;
-}
-
-const Chunk* ChunkManager::getChunk(const ChunkCoord& coord) const {
-    std::lock_guard<std::mutex> lock(chunksMutex);
-    auto it = chunks.find(coord);
-    if (it != chunks.end()) {
-        return it->second.get();
-    }
-    return nullptr;
-}
-
-std::vector<const Chunk*> ChunkManager::getRenderChunks() const {
-    std::vector<const Chunk*> result;
-    result.reserve(512);  // Reasonable initial capacity
-    
-    std::lock_guard<std::mutex> lock(chunksMutex);
-    
-    for (const auto& pair : chunks) {
-        if (!pair.second || !pair.second->isLoaded()) {
-            continue;
-        }
-        
-        // Skip chunks that collapsed to a single air node
-        const auto& svo = pair.second->getSVO();
-        if (svo.isCollapsed() && svo.getRootMaterial() == 0) {
-            continue;  // Entire chunk is air, skip for GPU
-        }
-        
-        result.push_back(pair.second.get());
+void ChunkManager::queueChunkRefine(const ChunkCoord& coord, const SuperChunkCoord& superCoord,
+                                     uint32_t targetDepth, float priority) {
+    if (pendingRefines.find(coord) != pendingRefines.end()) {
+        return;
     }
     
-    return result;
-}
-
-std::vector<Chunk*> ChunkManager::getSimulationChunks() {
-    std::vector<Chunk*> result;
-    result.reserve(CENTER_FULL_RES_SIZE * CENTER_FULL_RES_SIZE * CENTER_FULL_RES_SIZE);
-    
-    std::lock_guard<std::mutex> lock(chunksMutex);
-    
-    // Get the 4x4x4 full-resolution chunks at the center
-    int32_t anchorChunkX = static_cast<int32_t>(anchorPos.x / 16.0f);
-    int32_t anchorChunkY = static_cast<int32_t>(anchorPos.y / 16.0f);
-    int32_t anchorChunkZ = static_cast<int32_t>(anchorPos.z / 16.0f);
-    
-    for (int32_t dx = 0; dx < CENTER_FULL_RES_SIZE; ++dx) {
-        for (int32_t dy = 0; dy < CENTER_FULL_RES_SIZE; ++dy) {
-            for (int32_t dz = 0; dz < CENTER_FULL_RES_SIZE; ++dz) {
-                ChunkCoord coord(
-                    anchorChunkX + dx,
-                    anchorChunkY + dy,
-                    anchorChunkZ + dz,
-                    ChunkResolution::RES_0_25M
-                );
-                
-                auto it = chunks.find(coord);
-                if (it != chunks.end() && it->second->isLoaded()) {
-                    result.push_back(it->second.get());
-                }
-            }
-        }
-    }
-    
-    return result;
-}
-
-std::vector<const Chunk*> ChunkManager::getSimulationChunks() const {
-    std::vector<const Chunk*> result;
-    result.reserve(CENTER_FULL_RES_SIZE * CENTER_FULL_RES_SIZE * CENTER_FULL_RES_SIZE);
-    
-    std::lock_guard<std::mutex> lock(chunksMutex);
-    
-    int32_t anchorChunkX = static_cast<int32_t>(anchorPos.x / 16.0f);
-    int32_t anchorChunkY = static_cast<int32_t>(anchorPos.y / 16.0f);
-    int32_t anchorChunkZ = static_cast<int32_t>(anchorPos.z / 16.0f);
-    
-    for (int32_t dx = 0; dx < CENTER_FULL_RES_SIZE; ++dx) {
-        for (int32_t dy = 0; dy < CENTER_FULL_RES_SIZE; ++dy) {
-            for (int32_t dz = 0; dz < CENTER_FULL_RES_SIZE; ++dz) {
-                ChunkCoord coord(
-                    anchorChunkX + dx,
-                    anchorChunkY + dy,
-                    anchorChunkZ + dz,
-                    ChunkResolution::RES_0_25M
-                );
-                
-                auto it = chunks.find(coord);
-                if (it != chunks.end() && it->second->isLoaded()) {
-                    result.push_back(it->second.get());
-                }
-            }
-        }
-    }
-    
-    return result;
-}
-
-std::vector<ChunkCoord> ChunkManager::getSimulationChunkCoords(const math::Vec3& playerPos) const {
-    std::vector<ChunkCoord> result;
-    result.reserve(CENTER_FULL_RES_SIZE * CENTER_FULL_RES_SIZE * CENTER_FULL_RES_SIZE);
-    
-    // Calculate anchor based on player position
-    ChunkCoord pChunk = worldToChunkCoord(playerPos, ChunkResolution::RES_0_25M);
-    int32_t anchorX = pChunk.x - 1;
-    int32_t anchorY = pChunk.y - 1;
-    int32_t anchorZ = pChunk.z - 1;
-    
-    for (int32_t dx = 0; dx < CENTER_FULL_RES_SIZE; ++dx) {
-        for (int32_t dy = 0; dy < CENTER_FULL_RES_SIZE; ++dy) {
-            for (int32_t dz = 0; dz < CENTER_FULL_RES_SIZE; ++dz) {
-                result.push_back(ChunkCoord(
-                    anchorX + dx,
-                    anchorY + dy,
-                    anchorZ + dz,
-                    ChunkResolution::RES_0_25M
-                ));
-            }
-        }
-    }
-    
-    return result;
-}
-
-std::vector<ChunkCoord> ChunkManager::getRenderOnlyChunkCoords(const math::Vec3& playerPos) const {
-    std::vector<ChunkCoord> result;
-    
-    // Get all required chunks
-    std::vector<ChunkCoord> all = getRequiredChunks(playerPos);
-    
-    // Get simulation chunks
-    std::unordered_set<ChunkCoord, ChunkCoordHash> simChunks;
-    for (const auto& coord : getSimulationChunkCoords(playerPos)) {
-        simChunks.insert(coord);
-    }
-    
-    // Return only non-simulation chunks
-    for (const auto& coord : all) {
-        if (simChunks.find(coord) == simChunks.end()) {
-            result.push_back(coord);
-        }
-    }
-    
-    return result;
-}
-
-bool ChunkManager::isSimulationChunk(const ChunkCoord& coord, const math::Vec3& playerPos) const {
-    // Only full-resolution chunks can be simulation chunks
-    if (coord.resolution != ChunkResolution::RES_0_25M) {
-        return false;
-    }
-    
-    // Check if within 4x4x4 center
-    ChunkCoord pChunk = worldToChunkCoord(playerPos, ChunkResolution::RES_0_25M);
-    int32_t anchorX = pChunk.x - 1;
-    int32_t anchorY = pChunk.y - 1;
-    int32_t anchorZ = pChunk.z - 1;
-    
-    return coord.x >= anchorX && coord.x < anchorX + CENTER_FULL_RES_SIZE &&
-           coord.y >= anchorY && coord.y < anchorY + CENTER_FULL_RES_SIZE &&
-           coord.z >= anchorZ && coord.z < anchorZ + CENTER_FULL_RES_SIZE;
+    refineQueue.push({coord, superCoord, targetDepth, priority});
+    pendingRefines.insert(coord);
 }
 
 void ChunkManager::loadThreadFunc() {
+    static uint32_t chunksGenerated = 0;
+    
     while (running) {
         ChunkLoadRequest request;
         bool hasWork = false;
         
         {
             std::unique_lock<std::mutex> lock(loadQueueMutex);
-            
-            // Wait for work or shutdown
             loadCondition.wait_for(lock, std::chrono::milliseconds(50), [this] {
                 return !loadQueue.empty() || !running;
             });
@@ -387,145 +270,181 @@ void ChunkManager::loadThreadFunc() {
         }
         
         if (hasWork) {
-            // Check if already loaded
+            SuperChunk* super = nullptr;
             {
-                std::lock_guard<std::mutex> lock(chunksMutex);
-                auto it = chunks.find(request.coord);
-                if (it != chunks.end() && it->second->isLoaded()) {
+                std::lock_guard<std::mutex> lock(cacheMutex);
+                super = getOrCreateSuperChunk(request.superCoord);
+            }
+            
+            if (!super) continue;
+            
+            ChunkCoord first = request.superCoord.getFirstChunkCoord();
+            uint32_t lx = request.coord.x - first.x;
+            uint32_t ly = request.coord.y - first.y;
+            uint32_t lz = request.coord.z - first.z;
+            
+            {
+                std::lock_guard<std::mutex> lock(cacheMutex);
+                if (super->getChunk(lx, ly, lz) != nullptr) {
                     continue;
                 }
             }
             
-            // Try to load from file first
             std::string filename = getChunkFilename(request.coord);
-            std::unique_ptr<Chunk> chunk = std::make_unique<Chunk>(request.coord);
+            auto chunk = std::make_unique<Chunk>(request.coord);
             
             if (!chunk->loadFromFile(filename)) {
-                // Generate new chunk
-                chunk->generate(worldGenerator);
+                // Generate at target depth (renderDepth + 1)
+                chunk->generate(worldGenerator, request.targetDepth);
+                
+                chunksGenerated++;
+                if (chunksGenerated <= 10 || chunksGenerated % 50 == 0) {
+                    LOG_INFO("Generated chunk " + request.coord.toString() + 
+                             " at depth " + std::to_string(request.targetDepth) +
+                             " (total: " + std::to_string(chunksGenerated) + ")");
+                }
+                
+                std::string superDir = getSuperChunkDirectory(request.superCoord);
+                std::filesystem::create_directories(superDir);
                 chunk->saveToFile(filename);
             }
             
-            chunk->setLoaded(true);
-            
-            // Add to chunks map
             {
-                std::lock_guard<std::mutex> lock(chunksMutex);
-                chunks[request.coord] = std::move(chunk);
+                std::lock_guard<std::mutex> lock(cacheMutex);
+                super->setChunk(lx, ly, lz, std::move(chunk));
             }
         }
     }
 }
 
-void ChunkManager::unloadDistantChunks(const math::Vec3& playerPos) {
-    // Get set of currently required chunks
-    std::vector<ChunkCoord> required = getRequiredChunks(playerPos);
-    std::unordered_set<ChunkCoord, ChunkCoordHash> requiredSet(required.begin(), required.end());
-    
-    std::lock_guard<std::mutex> lock(chunksMutex);
-    
-    auto it = chunks.begin();
-    while (it != chunks.end()) {
-        const ChunkCoord& coord = it->first;
+void ChunkManager::refineThreadFunc() {
+    while (running) {
+        ChunkRefineRequest request;
+        bool hasWork = false;
         
-        // Unload if not in required set
-        if (requiredSet.find(coord) == requiredSet.end()) {
-            // Save before unloading
-            if (it->second && it->second->isLoaded()) {
-                std::string filename = getChunkFilename(coord);
-                it->second->saveToFile(filename);
+        {
+            std::unique_lock<std::mutex> lock(refineQueueMutex);
+            refineCondition.wait_for(lock, std::chrono::milliseconds(100), [this] {
+                return !refineQueue.empty() || !running;
+            });
+            
+            if (!running) break;
+            
+            if (!refineQueue.empty()) {
+                request = refineQueue.top();
+                refineQueue.pop();
+                pendingRefines.erase(request.coord);
+                hasWork = true;
             }
-            it = chunks.erase(it);
-        } else {
-            ++it;
+        }
+        
+        if (hasWork) {
+            SuperChunk* super = nullptr;
+            Chunk* chunk = nullptr;
+            
+            {
+                std::lock_guard<std::mutex> lock(cacheMutex);
+                super = superChunkCache.get(request.superCoord);
+                if (super) {
+                    ChunkCoord first = request.superCoord.getFirstChunkCoord();
+                    uint32_t lx = request.coord.x - first.x;
+                    uint32_t ly = request.coord.y - first.y;
+                    uint32_t lz = request.coord.z - first.z;
+                    chunk = super->getChunk(lx, ly, lz);
+                }
+            }
+            
+            if (!chunk || !chunk->hasMoreDetail()) continue;
+            if (chunk->getCurrentDepth() >= request.targetDepth) continue;
+            
+            // Refine the chunk to the new depth
+            chunk->refineDetail(worldGenerator, request.targetDepth);
+            
+            // Save updated chunk
+            std::string filename = getChunkFilename(request.coord);
+            chunk->saveToFile(filename);
         }
     }
 }
 
-float ChunkManager::getChunkSizeForResolution(ChunkResolution res) {
-    switch (res) {
-        case ChunkResolution::RES_0_25M: return 16.0f;
-        case ChunkResolution::RES_0_5M:  return 32.0f;
-        case ChunkResolution::RES_1M:    return 64.0f;
-        case ChunkResolution::RES_2M:    return 128.0f;
-        case ChunkResolution::RES_4M:    return 256.0f;
-        case ChunkResolution::RES_8M:    return 512.0f;
-        case ChunkResolution::RES_16M:   return 1024.0f;
-        case ChunkResolution::RES_32M:   return 2048.0f;
-        default: return 16.0f;
-    }
-}
-
-ChunkResolution ChunkManager::getResolutionForLayer(int layer) {
-    switch (layer) {
-        case 0: return ChunkResolution::RES_0_25M;
-        case 1: return ChunkResolution::RES_0_5M;
-        case 2: return ChunkResolution::RES_1M;
-        case 3: return ChunkResolution::RES_2M;
-        case 4: return ChunkResolution::RES_4M;
-        case 5: return ChunkResolution::RES_8M;
-        case 6: return ChunkResolution::RES_16M;
-        case 7: return ChunkResolution::RES_32M;
-        default: return ChunkResolution::RES_32M;
-    }
-}
-
-int ChunkManager::getLayerForGridPosition(int pos) {
-    if (pos >= 0 && pos < 18) {
-        return GRID_LAYERS[pos];
-    }
-    return 7;  // Default to outermost layer
-}
-
-ChunkCoord ChunkManager::worldToChunkCoord(const math::Vec3& worldPos, ChunkResolution res) const {
-    float size = getChunkSizeForResolution(res);
+Chunk* ChunkManager::getChunkAtWorld(const math::Vec3& worldPos) {
+    SuperChunkCoord superCoord = SuperChunkCoord::fromWorldPos(worldPos);
     
-    return ChunkCoord(
-        static_cast<int32_t>(std::floor(worldPos.x / size)),
-        static_cast<int32_t>(std::floor(worldPos.y / size)),
-        static_cast<int32_t>(std::floor(worldPos.z / size)),
-        res
-    );
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    SuperChunk* super = superChunkCache.get(superCoord);
+    if (!super) return nullptr;
+    
+    return super->getChunkAtWorldPos(worldPos);
 }
 
-std::vector<ChunkCoord> ChunkManager::getRequiredChunks(const math::Vec3& playerPos) const {
-    std::vector<ChunkCoord> result;
-    result.reserve(RENDER_CHUNKS_PER_AXIS * RENDER_CHUNKS_PER_AXIS * RENDER_CHUNKS_PER_AXIS);
+const Chunk* ChunkManager::getChunkAtWorld(const math::Vec3& worldPos) const {
+    return const_cast<ChunkManager*>(this)->getChunkAtWorld(worldPos);
+}
+
+std::vector<ChunkManager::ChunkRenderInfo> ChunkManager::getChunksForRendering(
+    const math::Vec3& cameraPos, const math::Vec3& cameraDir, float fov) const {
     
-    // Get anchor position (use current if initialized, otherwise calculate)
-    float ax, ay, az;
-    if (anchorInitialized) {
-        ax = anchorPos.x;
-        ay = anchorPos.y;
-        az = anchorPos.z;
-    } else {
-        ChunkCoord pChunk = worldToChunkCoord(playerPos, ChunkResolution::RES_0_25M);
-        ax = (pChunk.x - 1) * 16.0f;
-        ay = (pChunk.y - 1) * 16.0f;
-        az = (pChunk.z - 1) * 16.0f;
+    std::vector<ChunkRenderInfo> result;
+    result.reserve(1000);
+    
+    math::Vec3 camDirNorm = cameraDir.normalize();
+    
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    
+    for (const SuperChunk* super : superChunkCache.getAll()) {
+        math::Vec3 superCenter = super->getWorldPosition() + 
+                                  math::Vec3(SUPER_CHUNK_SIZE_METERS * 0.5f, 
+                                             SUPER_CHUNK_SIZE_METERS * 0.5f, 
+                                             SUPER_CHUNK_SIZE_METERS * 0.5f);
+        math::Vec3 toSuper = (superCenter - cameraPos).normalize();
+        float superDot = camDirNorm.dot(toSuper);
+        float superDist = (superCenter - cameraPos).length();
+        
+        if (superDot < -0.3f && superDist > SUPER_CHUNK_SIZE_METERS * 2) {
+            continue;
+        }
+        
+        for (const Chunk* chunk : super->getLoadedChunks()) {
+            if (!chunk || chunk->isAir()) continue;
+            
+            math::Vec3 chunkCenter = chunk->getWorldPosition() + 
+                                      math::Vec3(CHUNK_SIZE_METERS * 0.5f, 
+                                                 CHUNK_SIZE_METERS * 0.5f, 
+                                                 CHUNK_SIZE_METERS * 0.5f);
+            float distance = (chunkCenter - cameraPos).length();
+            
+            if (distance > VIEW_DISTANCE_METERS) continue;
+            
+            math::Vec3 toChunk = (chunkCenter - cameraPos).normalize();
+            float dot = camDirNorm.dot(toChunk);
+            
+            if (dot < -0.2f && distance > CHUNK_SIZE_METERS * 2) {
+                continue;
+            }
+            
+            uint32_t maxDepth = getMaxDepthForDistance(distance);
+            uint32_t availableDepth = chunk->getCurrentDepth();
+            
+            result.push_back({chunk, maxDepth, availableDepth, distance});
+        }
     }
     
-    // Iterate through all 18x18x18 grid positions
-    for (int gx = 0; gx < RENDER_CHUNKS_PER_AXIS; ++gx) {
-        for (int gy = 0; gy < RENDER_CHUNKS_PER_AXIS; ++gy) {
-            for (int gz = 0; gz < RENDER_CHUNKS_PER_AXIS; ++gz) {
-                // Determine layer based on max distance from center in any axis
-                int layer = std::max({GRID_LAYERS[gx], GRID_LAYERS[gy], GRID_LAYERS[gz]});
-                
-                ChunkResolution res = getResolutionForLayer(layer);
-                float chunkSize = getChunkSizeForResolution(res);
-                
-                // Calculate world position for this grid cell
-                float worldX = ax + GRID_OFFSETS[gx];
-                float worldY = ay + GRID_OFFSETS[gy];
-                float worldZ = az + GRID_OFFSETS[gz];
-                
-                // Convert to chunk coordinate for this resolution
-                int32_t cx = static_cast<int32_t>(std::floor(worldX / chunkSize));
-                int32_t cy = static_cast<int32_t>(std::floor(worldY / chunkSize));
-                int32_t cz = static_cast<int32_t>(std::floor(worldZ / chunkSize));
-                
-                result.push_back(ChunkCoord(cx, cy, cz, res));
+    std::sort(result.begin(), result.end(), 
+              [](const auto& a, const auto& b) { return a.distance < b.distance; });
+    
+    return result;
+}
+
+std::vector<const Chunk*> ChunkManager::getAllLoadedChunks() const {
+    std::vector<const Chunk*> result;
+    result.reserve(1000);
+    
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    
+    for (const SuperChunk* super : superChunkCache.getAll()) {
+        for (const Chunk* chunk : super->getLoadedChunks()) {
+            if (chunk && !chunk->isAir()) {
+                result.push_back(chunk);
             }
         }
     }
@@ -533,13 +452,42 @@ std::vector<ChunkCoord> ChunkManager::getRequiredChunks(const math::Vec3& player
     return result;
 }
 
-std::string ChunkManager::getChunkFilename(const ChunkCoord& coord) const {
-    return chunkDirectory + "/chunk_" + coord.toString() + ".bin";
+std::vector<Chunk*> ChunkManager::getSimulationChunks() {
+    std::vector<Chunk*> result;
+    
+    SuperChunkCoord centerSuper = SuperChunkCoord::fromWorldPos(lastPlayerPos);
+    
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    SuperChunk* super = superChunkCache.get(centerSuper);
+    if (super) {
+        result = super->getLoadedChunks();
+    }
+    
+    return result;
+}
+
+uint8_t ChunkManager::getMaterialAtWorld(const math::Vec3& worldPos, const math::Vec3& cameraPos) const {
+    const Chunk* chunk = getChunkAtWorld(worldPos);
+    if (!chunk) return 0;
+    
+    float distance = (worldPos - cameraPos).length();
+    uint32_t maxDepth = getMaxDepthForDistance(distance);
+    
+    return chunk->getMaterialAtWorld(worldPos, maxDepth);
 }
 
 size_t ChunkManager::getLoadedChunkCount() const {
-    std::lock_guard<std::mutex> lock(chunksMutex);
-    return chunks.size();
+    size_t count = 0;
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    for (const SuperChunk* super : superChunkCache.getAll()) {
+        count += super->getLoadedChunkCount();
+    }
+    return count;
+}
+
+size_t ChunkManager::getLoadedSuperChunkCount() const {
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    return superChunkCache.size();
 }
 
 size_t ChunkManager::getPendingLoadCount() const {
@@ -547,67 +495,26 @@ size_t ChunkManager::getPendingLoadCount() const {
     return pendingLoads.size();
 }
 
-std::vector<const Chunk*> ChunkManager::getVisibleChunks(const math::Vec3& cameraPos, 
-                                                         const math::Vec3& cameraDir,
-                                                         const math::Vec3& cameraUp,
-                                                         float fov) const {
-    std::vector<const Chunk*> result;
-    result.reserve(512);
-    
-    std::lock_guard<std::mutex> lock(chunksMutex);
-    
-    math::Vec3 normalizedDir = cameraDir.normalize();
-    
-    for (const auto& pair : chunks) {
-        if (!pair.second || !pair.second->isLoaded()) {
-            continue;
-        }
-        
-        // Skip chunks that collapsed to a single air node
-        const auto& svo = pair.second->getSVO();
-        if (svo.isCollapsed() && svo.getRootMaterial() == 0) {
-            continue;
-        }
-        
-        const auto& aabb = pair.second->getAABB();
-        float chunkSize = pair.second->getSize();
-        
-        // Always include chunks containing the camera
-        if (aabb.contains(cameraPos)) {
-            result.push_back(pair.second.get());
-            continue;
-        }
-        
-        math::Vec3 chunkCenter = aabb.getCenter();
-        float distance = (chunkCenter - cameraPos).length();
-        
-        // Always include nearby chunks
-        if (distance < chunkSize * 2.0f) {
-            result.push_back(pair.second.get());
-            continue;
-        }
-        
-        // Distance-based culling (8192m render distance)
-        if (distance > 9000.0f) {
-            continue;
-        }
-        
-        // Frustum check
-        math::Vec3 toChunk = (chunkCenter - cameraPos).normalize();
-        float dot = normalizedDir.dot(toChunk);
-        
-        // Include if chunk is within ~120 degree FOV
-        if (dot > -0.3f) {
-            result.push_back(pair.second.get());
-        }
-    }
-    
-    return result;
+size_t ChunkManager::getPendingRefineCount() const {
+    std::lock_guard<std::mutex> lock(refineQueueMutex);
+    return pendingRefines.size();
+}
+
+std::string ChunkManager::getChunkFilename(const ChunkCoord& coord) const {
+    SuperChunkCoord superCoord(
+        coord.x / static_cast<int32_t>(CHUNKS_PER_SUPER_AXIS),
+        coord.y / static_cast<int32_t>(CHUNKS_PER_SUPER_AXIS),
+        coord.z / static_cast<int32_t>(CHUNKS_PER_SUPER_AXIS)
+    );
+    return getSuperChunkDirectory(superCoord) + "/chunk_" + coord.toString() + ".bin";
+}
+
+std::string ChunkManager::getSuperChunkDirectory(const SuperChunkCoord& coord) const {
+    return chunkDirectory + "/" + coord.toString();
 }
 
 void ChunkManager::addChunkFromNetwork(const ChunkCoord& coord, const std::vector<uint8_t>& data) {
     if (data.size() < sizeof(networking::ChunkDataHeader)) {
-        LOG_ERROR("Invalid chunk data from network");
         return;
     }
     
@@ -615,13 +522,10 @@ void ChunkManager::addChunkFromNetwork(const ChunkCoord& coord, const std::vecto
         reinterpret_cast<const networking::ChunkDataHeader*>(data.data());
     
     if (header->type != networking::MessageType::CHUNK_DATA) {
-        LOG_ERROR("Invalid message type in chunk data");
         return;
     }
     
-    if (header->x != coord.x || header->y != coord.y || header->z != coord.z ||
-        header->resolution != static_cast<uint8_t>(coord.resolution)) {
-        LOG_WARNING("Chunk coordinate mismatch in network data");
+    if (header->x != coord.x || header->y != coord.y || header->z != coord.z) {
         return;
     }
     
@@ -629,27 +533,33 @@ void ChunkManager::addChunkFromNetwork(const ChunkCoord& coord, const std::vecto
     size_t nodeDataSize = header->nodeCount * sizeof(SVONode);
     
     if (data.size() < headerSize + nodeDataSize) {
-        LOG_ERROR("Incomplete chunk data from network");
         return;
     }
     
     std::vector<SVONode> nodes(header->nodeCount);
     std::memcpy(nodes.data(), data.data() + headerSize, nodeDataSize);
     
-    // Create or update chunk
-    std::lock_guard<std::mutex> lock(chunksMutex);
-    auto it = chunks.find(coord);
-    if (it == chunks.end()) {
-        chunks[coord] = std::make_unique<Chunk>(coord);
-        it = chunks.find(coord);
-    }
+    SuperChunkCoord superCoord(
+        coord.x / static_cast<int32_t>(CHUNKS_PER_SUPER_AXIS),
+        coord.y / static_cast<int32_t>(CHUNKS_PER_SUPER_AXIS),
+        coord.z / static_cast<int32_t>(CHUNKS_PER_SUPER_AXIS)
+    );
     
-    Chunk* chunk = it->second.get();
-    chunk->getSVO().clear();
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    SuperChunk* super = getOrCreateSuperChunk(superCoord);
+    if (!super) return;
+    
+    ChunkCoord first = superCoord.getFirstChunkCoord();
+    uint32_t lx = coord.x - first.x;
+    uint32_t ly = coord.y - first.y;
+    uint32_t lz = coord.z - first.z;
+    
+    auto chunk = std::make_unique<Chunk>(coord);
     chunk->getSVO().loadNodes(nodes);
     chunk->setLoaded(true);
     
-    // Remove from pending if it was there
+    super->setChunk(lx, ly, lz, std::move(chunk));
+    
     {
         std::lock_guard<std::mutex> queueLock(loadQueueMutex);
         pendingLoads.erase(coord);

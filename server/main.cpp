@@ -1,4 +1,6 @@
 #include "../engine/voxels/chunk_manager.h"
+#include "../engine/voxels/chunk.h"
+#include "../engine/voxels/world_constants.h"
 #include "../engine/networking/network.h"
 #include "../game/world/world_generator.h"
 #include "../engine/math/vec3.h"
@@ -35,10 +37,13 @@ int main() {
     // Track which chunks have been sent to each player to avoid duplicates
     std::unordered_map<ENetPeer*, std::unordered_set<chonk::voxels::ChunkCoord, chonk::voxels::ChunkCoordHash>> sentChunks;
     
+    // Frame counter
+    uint32_t frameCounter = 0;
+    
     // Set up network callbacks
     network.onClientConnected = [&players, &sentChunks](ENetPeer* peer) {
         Player player;
-        player.position = chonk::math::Vec3(0, 5490, 0); // Spawn at terrain level
+        player.position = chonk::math::Vec3(0, 5120, 0); // Spawn at terrain level
         player.peer = peer;
         players[peer] = player;
         sentChunks[peer] = std::unordered_set<chonk::voxels::ChunkCoord, chonk::voxels::ChunkCoordHash>();
@@ -61,29 +66,32 @@ int main() {
             return; // Already sent, skip
         }
         
-        // Get or generate the chunk
-        auto* chunk = chunkManager.getChunk(coord);
+        // Get or generate the chunk using world position
+        chonk::math::Vec3 worldPos = coord.toWorldPos();
+        auto* chunk = chunkManager.getChunkAtWorld(worldPos);
+        
         if (!chunk) {
-            // Chunk doesn't exist in manager, create it temporarily to generate and send
+            // Chunk doesn't exist, create it temporarily to generate and send
             chonk::voxels::Chunk tempChunk(coord);
             tempChunk.generate(&worldGen);
             network.sendChunk(peer, tempChunk);
             sent.insert(coord);
         } else {
-            // Chunk exists, make sure it's loaded
+            // Chunk exists
             if (!chunk->isLoaded()) {
-                chunk->generate(&worldGen);
+                // Can't modify const chunk, skip
+            } else {
+                network.sendChunk(peer, *chunk);
+                sent.insert(coord);
             }
-            network.sendChunk(peer, *chunk);
-            sent.insert(coord);
         }
     };
     
-    network.onPlayerPositionReceived = [&players, &chunkManager](ENetPeer* peer, const chonk::math::Vec3& pos) {
+    network.onPlayerPositionReceived = [&players, &chunkManager, &frameCounter](ENetPeer* peer, const chonk::math::Vec3& pos) {
         if (players.find(peer) != players.end()) {
             players[peer].position = pos;
             // Server updates chunk manager to generate/load chunks in simulation distance
-            chunkManager.update(pos);
+            chunkManager.update(pos, frameCounter);
         }
     };
     
@@ -92,6 +100,8 @@ int main() {
     auto lastUpdate = std::chrono::steady_clock::now();
     
     while (running) {
+        frameCounter++;
+        
         // Update network
         network.update();
         
@@ -99,7 +109,7 @@ int main() {
         auto currentTime = std::chrono::steady_clock::now();
         if (std::chrono::duration<float>(currentTime - lastUpdate).count() > 0.1f) {
             for (auto& pair : players) {
-                chunkManager.update(pair.second.position);
+                chunkManager.update(pair.second.position, frameCounter);
             }
             lastUpdate = currentTime;
         }
@@ -113,4 +123,3 @@ int main() {
     
     return 0;
 }
-

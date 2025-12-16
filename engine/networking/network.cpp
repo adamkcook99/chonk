@@ -1,5 +1,6 @@
 #include "network.h"
 #include "../voxels/chunk.h"
+#include "../voxels/world_constants.h"
 #include "../math/vec3.h"
 #include "../core/logging.h"
 #include <cstring>
@@ -128,15 +129,9 @@ void NetworkManager::processPacket(ENetEvent& event) {
             }
             
             ChunkDataHeader* header = reinterpret_cast<ChunkDataHeader*>(event.packet->data);
-            voxels::ChunkCoord coord(
-                header->x,
-                header->y,
-                header->z,
-                static_cast<voxels::ChunkResolution>(header->resolution)
-            );
+            voxels::ChunkCoord coord(header->x, header->y, header->z);
             
             // Pass the entire packet data (including header) to the callback
-            // addChunkFromNetwork expects the full packet with header
             std::vector<uint8_t> data(event.packet->dataLength);
             std::memcpy(data.data(), event.packet->data, event.packet->dataLength);
             
@@ -166,12 +161,7 @@ void NetworkManager::processPacket(ENetEvent& event) {
             }
             
             ChunkRequestMessage* msg = reinterpret_cast<ChunkRequestMessage*>(event.packet->data);
-            voxels::ChunkCoord coord(
-                msg->x,
-                msg->y,
-                msg->z,
-                static_cast<voxels::ChunkResolution>(msg->resolution)
-            );
+            voxels::ChunkCoord coord(msg->x, msg->y, msg->z);
             
             if (onChunkRequestReceived) {
                 onChunkRequestReceived(event.peer, coord);
@@ -212,7 +202,6 @@ void NetworkManager::requestChunk(const voxels::ChunkCoord& coord) {
     msg.x = coord.x;
     msg.y = coord.y;
     msg.z = coord.z;
-    msg.resolution = static_cast<uint8_t>(coord.resolution);
     
     ENetPacket* packet = enet_packet_create(&msg, sizeof(msg), ENET_PACKET_FLAG_RELIABLE);
     enet_peer_send(serverPeer, 0, packet);
@@ -238,12 +227,11 @@ void NetworkManager::serializeChunk(const voxels::Chunk& chunk, std::vector<uint
     header.x = coord.x;
     header.y = coord.y;
     header.z = coord.z;
-    header.resolution = static_cast<uint8_t>(coord.resolution);
+    header.maxDepth = voxels::CHUNK_SVO_DEPTH;  // Full depth
     
     const auto& nodes = chunk.getSVO().getNodes();
     header.nodeCount = static_cast<uint32_t>(nodes.size());
     
-    // Debug: Log if chunk has no nodes
     if (nodes.empty()) {
         LOG_WARNING("Serializing chunk " + coord.toString() + " with 0 nodes!");
     }
@@ -260,4 +248,3 @@ void NetworkManager::serializeChunk(const voxels::Chunk& chunk, std::vector<uint
 
 } // namespace networking
 } // namespace chonk
-

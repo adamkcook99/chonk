@@ -60,7 +60,7 @@ int main() {
     // World coordinates: floats in meters, can be negative
     // Chunk coordinates: int32_t, calculated as floor(worldPos / chunkSize)
     // For RES_0_25M chunks (16m size): chunk y = floor(5490 / 16) = 343
-    chonk::math::Vec3 playerPos(0, 4100, 0); // Start at terrain level
+    chonk::math::Vec3 playerPos(0, 5125, 0); // Start at terrain level
     
     // Camera rotation (yaw and pitch in radians)
     float yaw = 0.0f;      // Horizontal rotation (around Y axis)
@@ -183,41 +183,25 @@ int main() {
                      std::to_string(playerPos.z) + ")");
         }
         
-        // Update chunk manager
-        chunkManager.update(playerPos);
+        // Update chunk manager (frame-based for LOD caching)
+        static uint32_t frameCounter = 0;
+        frameCounter++;
+        chunkManager.update(playerPos, frameCounter);
         
         // Update network
         network.update();
         
-        // Request chunks from server if needed (only once per chunk)
-        // Only check every few frames to avoid spamming requests
-        static int requestFrameCounter = 0;
-        requestFrameCounter++;
-        if (requestFrameCounter % 10 == 0) { // Check every 10 frames
-            auto requiredChunks = chunkManager.getRequiredChunks(playerPos);
-            for (const auto& coord : requiredChunks) {
-                const auto* chunk = chunkManager.getChunk(coord);
-                if (!chunk || !chunk->isLoaded()) {
-                    // Only request if we haven't already requested it
-                    if (requestedChunks.find(coord) == requestedChunks.end()) {
-                        network.requestChunk(coord);
-                        requestedChunks.insert(coord);
-                    }
-                }
-            }
-        }
-        
-        // Get visible chunks (frustum culled) for rendering
-        // Client keeps 13x13x13 region in memory, but only sends visible chunks to GPU
+        // Get chunks for rendering (frustum culled with LOD)
         float fov = 0.5f; // Field of view
-        auto visibleChunks = chunkManager.getVisibleChunks(playerPos, cameraDir, cameraUp, fov);
+        auto visibleChunks = chunkManager.getAllLoadedChunks();
         
-        // Debug: Print chunk count occasionally (every 1000 updates, same as player position)
+        // Debug: Print chunk count occasionally (every 1000 updates)
         if (updateCounter % 1000 == 0) {
-            auto renderChunks = chunkManager.getRenderChunks();
-            LOG_INFO("Loaded chunks: " + std::to_string(renderChunks.size()) + 
-                     ", Visible chunks: " + std::to_string(visibleChunks.size()) +
-                     ", Requested chunks: " + std::to_string(requestedChunks.size()));
+            LOG_INFO("Loaded: " + std::to_string(chunkManager.getLoadedChunkCount()) + 
+                     " chunks, " + std::to_string(chunkManager.getLoadedSuperChunkCount()) +
+                     " super, Visible (non-air): " + std::to_string(visibleChunks.size()) +
+                     ", Pending: " + std::to_string(chunkManager.getPendingLoadCount()) +
+                     " load, " + std::to_string(chunkManager.getPendingRefineCount()) + " refine");
         }
         
         // Calculate FPS

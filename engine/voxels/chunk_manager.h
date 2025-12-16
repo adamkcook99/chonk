@@ -1,6 +1,8 @@
 #pragma once
 
 #include "chunk.h"
+#include "super_chunk.h"
+#include "world_constants.h"
 #include "../math/vec3.h"
 #include <unordered_map>
 #include <unordered_set>
@@ -17,9 +19,7 @@ namespace chonk {
 namespace networking {
     struct ChunkDataHeader;
 }
-}
 
-namespace chonk {
 namespace game {
 namespace world {
     class WorldGenerator;
@@ -28,123 +28,146 @@ namespace world {
 
 namespace voxels {
 
-// Priority queue entry for chunk loading
+// ============================================================================
+// Chunk load request for async loading
+// ============================================================================
 struct ChunkLoadRequest {
     ChunkCoord coord;
-    float priority;  // Lower = higher priority (distance-based)
+    SuperChunkCoord superCoord;
+    uint32_t targetDepth;  // Depth to generate to (renderDepth + 1)
+    float priority;        // Lower = higher priority (closer = lower)
     
     bool operator<(const ChunkLoadRequest& other) const {
-        return priority > other.priority;  // Min-heap
+        return priority > other.priority;  // Min-heap (lower priority first)
     }
 };
 
+// ============================================================================
+// Chunk refinement request for background detail loading
+// ============================================================================
+struct ChunkRefineRequest {
+    ChunkCoord coord;
+    SuperChunkCoord superCoord;
+    uint32_t targetDepth;  // New depth to refine to
+    float priority;
+    
+    bool operator<(const ChunkRefineRequest& other) const {
+        return priority > other.priority;
+    }
+};
+
+// ============================================================================
+// Chunk Manager - manages super chunks and chunks with LOD
+// ============================================================================
 class ChunkManager {
 public:
     ChunkManager();
     ~ChunkManager();
     
     // Initialize with world generator
-    void initialize(class game::world::WorldGenerator* generator);
+    void initialize(game::world::WorldGenerator* generator);
     
-    // Update chunk loading/unloading based on player position
-    void update(const math::Vec3& playerPos);
+    // Update chunk loading based on player position
+    void update(const math::Vec3& playerPos, uint32_t currentFrame);
     
-    // Get chunk (may return nullptr if not loaded)
-    Chunk* getChunk(const ChunkCoord& coord);
-    const Chunk* getChunk(const ChunkCoord& coord) const;
+    // Get chunk at world position (may return nullptr if not loaded)
+    Chunk* getChunkAtWorld(const math::Vec3& worldPos);
+    const Chunk* getChunkAtWorld(const math::Vec3& worldPos) const;
     
-    // Get all non-air chunks for GPU rendering (18x18x18 region)
-    std::vector<const Chunk*> getRenderChunks() const;
+    // Get chunks for rendering (non-air, within view distance)
+    // Returns chunks with their recommended maxDepth based on distance from camera
+    struct ChunkRenderInfo {
+        const Chunk* chunk;
+        uint32_t maxDepth;      // Depth to render at
+        uint32_t availableDepth; // Depth available in chunk
+        float distance;
+    };
+    std::vector<ChunkRenderInfo> getChunksForRendering(const math::Vec3& cameraPos, 
+                                                        const math::Vec3& cameraDir,
+                                                        float fov) const;
     
-    // Get chunks in simulation distance (4x4x4 full-res center)
-    // These are the chunks the server manages for physics/gameplay
+    // Get all loaded non-air chunks (for simple rendering)
+    std::vector<const Chunk*> getAllLoadedChunks() const;
+    
+    // Get simulation chunks (center super chunk at full detail)
     std::vector<Chunk*> getSimulationChunks();
-    std::vector<const Chunk*> getSimulationChunks() const;
     
-    // Get chunk coordinates that need to be requested from server
-    // (render-only chunks outside simulation distance)
-    std::vector<ChunkCoord> getRenderOnlyChunkCoords(const math::Vec3& playerPos) const;
-    
-    // Get visible chunks (frustum culled) for rendering
-    std::vector<const Chunk*> getVisibleChunks(const math::Vec3& cameraPos, 
-                                               const math::Vec3& cameraDir,
-                                               const math::Vec3& cameraUp,
-                                               float fov) const;
+    // Material query with LOD
+    uint8_t getMaterialAtWorld(const math::Vec3& worldPos, const math::Vec3& cameraPos) const;
     
     // Add chunk from network (deserialized)
     void addChunkFromNetwork(const ChunkCoord& coord, const std::vector<uint8_t>& data);
     
-    // Get all required chunks for a player position (18x18x18 jawbreaker pattern)
-    std::vector<ChunkCoord> getRequiredChunks(const math::Vec3& playerPos) const;
-    
-    // Get simulation chunks only (4x4x4 full-res center)
-    std::vector<ChunkCoord> getSimulationChunkCoords(const math::Vec3& playerPos) const;
-    
-    // Check if a chunk is within simulation distance
-    bool isSimulationChunk(const ChunkCoord& coord, const math::Vec3& playerPos) const;
-    
-    // Get loading statistics
+    // Statistics
     size_t getLoadedChunkCount() const;
+    size_t getLoadedSuperChunkCount() const;
     size_t getPendingLoadCount() const;
+    size_t getPendingRefineCount() const;
     
     void shutdown();
     
     // Set chunk save directory
     void setChunkDirectory(const std::string& dir) { chunkDirectory = dir; }
     
-    // Get current anchor position (corner of center 4x4x4)
-    math::Vec3 getAnchorPosition() const { return anchorPos; }
-    
 private:
-    // LOD system constants
-    // 18x18x18 render grid with jawbreaker pattern:
-    // - Center 4x4x4 at full resolution (16m chunks, 0.25m blocks)
-    // - Each layer outward doubles in size
-    // - Player stays in 2x2x2 center section; chunks shift when they leave
-    static constexpr int32_t RENDER_CHUNKS_PER_AXIS = 18;
-    static constexpr int32_t CENTER_FULL_RES_SIZE = 4;  // 4x4x4 full-res chunks
-    static constexpr int32_t CENTER_PLAYER_SIZE = 2;    // 2x2x2 player movement zone
-    static constexpr int32_t NUM_LOD_LAYERS = 8;        // 0.25m to 32m block sizes
+    // Super chunk cache (popularity-ordered)
+    SuperChunkCache superChunkCache;
+    mutable std::mutex cacheMutex;
     
-    // Chunk storage
-    std::unordered_map<ChunkCoord, std::unique_ptr<Chunk>, ChunkCoordHash> chunks;
-    mutable std::mutex chunksMutex;
+    // World generator
+    game::world::WorldGenerator* worldGenerator = nullptr;
+    std::string chunkDirectory = "chunks";
     
-    // Generation
-    game::world::WorldGenerator* worldGenerator;
-    std::string chunkDirectory;
-    
-    // Async loading with priority queue
-    std::thread loadThread;
-    std::atomic<bool> running;
+    // Async loading threads (multiple for faster loading)
+    static constexpr int NUM_LOAD_THREADS = 4;
+    std::vector<std::thread> loadThreads;
+    std::atomic<bool> running{false};
     std::priority_queue<ChunkLoadRequest> loadQueue;
-    std::unordered_set<ChunkCoord, ChunkCoordHash> pendingLoads;  // Track what's in queue
+    std::unordered_set<ChunkCoord, ChunkCoordHash> pendingLoads;
     mutable std::mutex loadQueueMutex;
     std::condition_variable loadCondition;
     
+    // Background refinement thread
+    std::thread refineThread;
+    std::priority_queue<ChunkRefineRequest> refineQueue;
+    std::unordered_set<ChunkCoord, ChunkCoordHash> pendingRefines;
+    mutable std::mutex refineQueueMutex;
+    std::condition_variable refineCondition;
+    
+    // Current player position
+    math::Vec3 lastPlayerPos{0, 0, 0};
+    SuperChunkCoord lastPlayerSuperChunk{0, 0, 0};
+    uint32_t currentFrame = 0;
+    
+    // Thread functions
     void loadThreadFunc();
-    void queueChunkLoad(const ChunkCoord& coord, float priority);
-    void unloadDistantChunks(const math::Vec3& playerPos);
-    ChunkCoord worldToChunkCoord(const math::Vec3& worldPos, ChunkResolution res) const;
-    std::string getChunkFilename(const ChunkCoord& coord) const;
+    void refineThreadFunc();
     
-    // LOD helpers
-    static float getChunkSizeForResolution(ChunkResolution res);
-    static ChunkResolution getResolutionForLayer(int layer);
-    static int getLayerForGridPosition(int pos);
+    void queueChunkLoad(const ChunkCoord& coord, const SuperChunkCoord& superCoord, 
+                        uint32_t targetDepth, float priority);
+    void queueChunkRefine(const ChunkCoord& coord, const SuperChunkCoord& superCoord,
+                          uint32_t targetDepth, float priority);
     
-    // Player position tracking
-    math::Vec3 anchorPos;           // World position of corner of center 4x4x4
-    ChunkCoord playerChunk;         // Player's current 16m chunk
-    bool anchorInitialized = false;
+    // Calculate which super chunks are needed (5x5x5 around player)
+    std::vector<SuperChunkCoord> getRequiredSuperChunks(const math::Vec3& playerPos) const;
     
-    // Update anchor when player moves outside 2x2x2 center
-    void updateAnchorIfNeeded(const math::Vec3& playerPos);
+    // Calculate which chunks in a super chunk need loading
+    std::vector<ChunkCoord> getRequiredChunksInSuper(const SuperChunkCoord& superCoord, 
+                                                      const math::Vec3& playerPos) const;
     
-    // Calculate priority for loading (lower = higher priority)
+    // Get or create super chunk
+    SuperChunk* getOrCreateSuperChunk(const SuperChunkCoord& coord);
+    
+    // Calculate load priority (distance-based)
     float calculateLoadPriority(const ChunkCoord& coord, const math::Vec3& playerPos) const;
+    
+    // Calculate target depth for a chunk based on distance
+    uint32_t calculateTargetDepth(const ChunkCoord& coord, const math::Vec3& playerPos) const;
+    
+    // Chunk file management
+    std::string getChunkFilename(const ChunkCoord& coord) const;
+    std::string getSuperChunkDirectory(const SuperChunkCoord& coord) const;
 };
 
 } // namespace voxels
 } // namespace chonk
-
