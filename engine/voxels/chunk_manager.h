@@ -1,25 +1,24 @@
 #pragma once
 
 #include "chunk.h"
-#include "super_chunk.h"
+#include "chunk_array.h"
+#include "world_tree.h"
 #include "world_constants.h"
 #include "../math/vec3.h"
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
+#include "tree27.h"
 #include <thread>
 #include <mutex>
+#include <shared_mutex>
 #include <atomic>
 #include <queue>
+#include <condition_variable>
+#include <unordered_set>
+#include <unordered_map>
+#include <vector>
 #include <memory>
 #include <string>
-#include <condition_variable>
 
 namespace chonk {
-namespace networking {
-    struct ChunkDataHeader;
-}
-
 namespace game {
 namespace world {
     class WorldGenerator;
@@ -29,144 +28,216 @@ namespace world {
 namespace voxels {
 
 // ============================================================================
-// Chunk load request for async loading
+// GPUChunkUpdate: Data structure for incremental GPU buffer updates
 // ============================================================================
-struct ChunkLoadRequest {
-    ChunkCoord coord;
-    SuperChunkCoord superCoord;
-    uint32_t targetDepth;  // Depth to generate to (renderDepth + 1)
-    float priority;        // Lower = higher priority (closer = lower)
-    
-    bool operator<(const ChunkLoadRequest& other) const {
-        return priority > other.priority;  // Min-heap (lower priority first)
-    }
+// This is filled by background workers and consumed by the renderer
+// without blocking the main thread.
+// ============================================================================
+
+struct GPUChunkMeta {
+    uint32_t nodeOffset;      // Start index in global node array
+    uint32_t nodeCount;       // Number of nodes for this chunk
+    uint32_t maxDepth;        // LOD depth limit
+    uint32_t rootMaterial;    // For quick air check (0 = air)
+};
+
+struct GPUChunkUpdate {
+    std::vector<Tree27Node> nodes;                      // All node data
+    std::vector<GPUChunkMeta> metas;                    // Metadata for each array slot (17^3)
+    std::vector<uint32_t> updatedSlots;                 // Which array slots changed
+    uint64_t updateId = 0;                              // Monotonic update ID
+    math::Vec3 arrayOrigin{0, 0, 0};                    // World position of chunk[0,0,0]
+    size_t loadedChunkCount = 0;                        // Number of loaded chunks
+    bool ready = false;                                 // Data is ready for GPU upload
 };
 
 // ============================================================================
-// Chunk refinement request for background detail loading
+// ChunkManager: Manages 17×17×17 chunk array + world tree
 // ============================================================================
-struct ChunkRefineRequest {
-    ChunkCoord coord;
-    SuperChunkCoord superCoord;
-    uint32_t targetDepth;  // New depth to refine to
-    float priority;
-    
-    bool operator<(const ChunkRefineRequest& other) const {
-        return priority > other.priority;
-    }
-};
+// - Handles chunk loading/unloading based on player position
+// - Uses async worker threads for generation
+// - Maintains world tree for distant LOD
+// ============================================================================
 
-// ============================================================================
-// Chunk Manager - manages super chunks and chunks with LOD
-// ============================================================================
 class ChunkManager {
 public:
     ChunkManager();
     ~ChunkManager();
     
-    // Initialize with world generator
+    // ========================================================================
+    // Initialization
+    // ========================================================================
+    
     void initialize(game::world::WorldGenerator* generator);
+    void shutdown();
+    
+    // ========================================================================
+    // Update
+    // ========================================================================
     
     // Update chunk loading based on player position
     void update(const math::Vec3& playerPos, uint32_t currentFrame);
     
-    // Get chunk at world position (may return nullptr if not loaded)
+    // ========================================================================
+    // Chunk Access
+    // ========================================================================
+    
+    // Get chunk at world position (from array, nullptr if not loaded/out of bounds)
     Chunk* getChunkAtWorld(const math::Vec3& worldPos);
     const Chunk* getChunkAtWorld(const math::Vec3& worldPos) const;
     
-    // Get chunks for rendering (non-air, within view distance)
-    // Returns chunks with their recommended maxDepth based on distance from camera
-    struct ChunkRenderInfo {
-        const Chunk* chunk;
-        uint32_t maxDepth;      // Depth to render at
-        uint32_t availableDepth; // Depth available in chunk
-        float distance;
-    };
-    std::vector<ChunkRenderInfo> getChunksForRendering(const math::Vec3& cameraPos, 
-                                                        const math::Vec3& cameraDir,
-                                                        float fov) const;
+    // Get chunk by coordinate
+    Chunk* getChunkByCoord(const ChunkCoord& coord);
+    const Chunk* getChunkByCoord(const ChunkCoord& coord) const;
     
-    // Get all loaded non-air chunks (for simple rendering)
+    // ========================================================================
+    // Material Query
+    // ========================================================================
+    
+    // Query material at world position
+    // Uses chunk array for nearby, world tree for distant
+    uint8_t getMaterialAtWorld(const math::Vec3& worldPos) const;
+    
+    // ========================================================================
+    // Rendering Data
+    // ========================================================================
+    
+    // Get all loaded non-air chunks for rendering
     std::vector<const Chunk*> getAllLoadedChunks() const;
     
-    // Get simulation chunks (center super chunk at full detail)
-    std::vector<Chunk*> getSimulationChunks();
+    // Data for GPU upload
+    struct GPUChunkData {
+        const Chunk* chunk;
+        uint32_t maxDepth;
+        uint32_t arrayIndexX;
+        uint32_t arrayIndexY;
+        uint32_t arrayIndexZ;
+    };
+    std::vector<GPUChunkData> getChunksForGPU() const;
     
-    // Material query with LOD
-    uint8_t getMaterialAtWorld(const math::Vec3& worldPos, const math::Vec3& cameraPos) const;
+    // Get chunk array for direct access
+    const ChunkArray& getChunkArray() const { return chunkArray; }
     
-    // Add chunk from network (deserialized)
-    void addChunkFromNetwork(const ChunkCoord& coord, const std::vector<uint8_t>& data);
+    // Get world tree for GPU upload
+    const WorldTree& getWorldTree() const { return worldTree; }
     
+    // ========================================================================
+    // Network Integration
+    // ========================================================================
+    
+    // Add chunk received from server
+    void addChunkFromNetwork(const ChunkCoord& coord, const std::vector<uint8_t>& data, uint32_t depth);
+    
+    // ========================================================================
     // Statistics
+    // ========================================================================
+    
     size_t getLoadedChunkCount() const;
-    size_t getLoadedSuperChunkCount() const;
     size_t getPendingLoadCount() const;
-    size_t getPendingRefineCount() const;
+    size_t getWorldTreeNodeCount() const { return worldTree.getNodeCount(); }
     
-    void shutdown();
+    // ========================================================================
+    // GPU Update System
+    // ========================================================================
     
-    // Set chunk save directory
+    // Check if there's a new GPU update ready (non-blocking)
+    bool hasGPUUpdate() const;
+    
+    // Get the latest GPU update (swaps internal buffers)
+    // Returns nullptr if no update ready
+    const GPUChunkUpdate* getGPUUpdate();
+    
+    // Get current update ID (for checking if update needed)
+    uint64_t getCurrentGPUUpdateId() const { return gpuUpdateId.load(); }
+    
+    // ========================================================================
+    // Configuration
+    // ========================================================================
+    
     void setChunkDirectory(const std::string& dir) { chunkDirectory = dir; }
+    const std::string& getChunkDirectory() const { return chunkDirectory; }
     
 private:
-    // Super chunk cache (popularity-ordered)
-    SuperChunkCache superChunkCache;
-    mutable std::mutex cacheMutex;
+    // Chunk storage
+    ChunkArray chunkArray;
+    WorldTree worldTree;
+    mutable std::shared_mutex chunkArrayMutex;  // Protects chunk array access
     
     // World generator
-    game::world::WorldGenerator* worldGenerator = nullptr;
+    game::world::WorldGenerator* generator = nullptr;
     std::string chunkDirectory = "chunks";
     
-    // Async loading threads (multiple for faster loading)
+    // Player tracking
+    math::Vec3 lastPlayerPos{0, 0, 0};
+    ChunkCoord lastPlayerChunkCoord{0, 0, 0};
+    uint32_t currentFrame = 0;
+    bool firstUpdate = true;
+    bool initialLoadComplete = false;  // True when all 17^3 chunks have root nodes
+    
+    // ========================================================================
+    // Async Loading System
+    // ========================================================================
+    
     static constexpr int NUM_LOAD_THREADS = 4;
     std::vector<std::thread> loadThreads;
     std::atomic<bool> running{false};
-    std::priority_queue<ChunkLoadRequest> loadQueue;
-    std::unordered_set<ChunkCoord, ChunkCoordHash> pendingLoads;
+    
+    // Load queue
+    std::priority_queue<ChunkArray::ChunkLoadInfo, 
+                        std::vector<ChunkArray::ChunkLoadInfo>,
+                        std::function<bool(const ChunkArray::ChunkLoadInfo&, const ChunkArray::ChunkLoadInfo&)>> loadQueue;
+    std::unordered_map<ChunkCoord, uint32_t, ChunkCoordHash> pendingLoads;  // coord -> requested depth
     mutable std::mutex loadQueueMutex;
     std::condition_variable loadCondition;
     
-    // Background refinement thread
-    std::thread refineThread;
-    std::priority_queue<ChunkRefineRequest> refineQueue;
-    std::unordered_set<ChunkCoord, ChunkCoordHash> pendingRefines;
-    mutable std::mutex refineQueueMutex;
-    std::condition_variable refineCondition;
+    // Completed chunks waiting to be added to array
+    struct CompletedChunk {
+        std::unique_ptr<Chunk> chunk;
+        uint32_t ix, iy, iz;
+        uint32_t depth;
+    };
+    std::queue<CompletedChunk> completedChunks;
+    mutable std::mutex completedMutex;
     
-    // Current player position
-    math::Vec3 lastPlayerPos{0, 0, 0};
-    SuperChunkCoord lastPlayerSuperChunk{0, 0, 0};
-    uint32_t currentFrame = 0;
+    // ========================================================================
+    // GPU Update System
+    // ========================================================================
     
-    // Thread functions
+    // Double-buffered GPU updates
+    GPUChunkUpdate gpuUpdateFront;      // Being filled by worker
+    GPUChunkUpdate gpuUpdateBack;       // Ready for renderer consumption
+    mutable std::mutex gpuUpdateMutex;
+    std::atomic<uint64_t> gpuUpdateId{0};
+    std::atomic<bool> gpuUpdateReady{false};
+    
+    // Track which chunks need GPU update
+    std::unordered_set<uint32_t> dirtyChunkSlots;  // Array indices needing update
+    bool fullGPUUpdateNeeded = true;                // Force full rebuild (after recenter)
+    
+    // GPU update worker
+    std::thread gpuUpdateThread;
+    std::atomic<bool> gpuUpdateRunning{false};
+    std::condition_variable gpuUpdateCondition;
+    
+    // ========================================================================
+    // Internal Methods
+    // ========================================================================
+    
     void loadThreadFunc();
-    void refineThreadFunc();
+    void queueChunkLoad(const ChunkArray::ChunkLoadInfo& info);
+    void processCompletedChunks();
     
-    void queueChunkLoad(const ChunkCoord& coord, const SuperChunkCoord& superCoord, 
-                        uint32_t targetDepth, float priority);
-    void queueChunkRefine(const ChunkCoord& coord, const SuperChunkCoord& superCoord,
-                          uint32_t targetDepth, float priority);
+    // GPU update worker
+    void gpuUpdateWorkerFunc();
+    void collectGPUData(GPUChunkUpdate& update, bool fullUpdate);
+    void startGPUUpdateWorker();
+    void stopGPUUpdateWorker();
+    void triggerGPUUpdate(bool fullUpdate = false);
     
-    // Calculate which super chunks are needed (5x5x5 around player)
-    std::vector<SuperChunkCoord> getRequiredSuperChunks(const math::Vec3& playerPos) const;
-    
-    // Calculate which chunks in a super chunk need loading
-    std::vector<ChunkCoord> getRequiredChunksInSuper(const SuperChunkCoord& superCoord, 
-                                                      const math::Vec3& playerPos) const;
-    
-    // Get or create super chunk
-    SuperChunk* getOrCreateSuperChunk(const SuperChunkCoord& coord);
-    
-    // Calculate load priority (distance-based)
-    float calculateLoadPriority(const ChunkCoord& coord, const math::Vec3& playerPos) const;
-    
-    // Calculate target depth for a chunk based on distance
-    uint32_t calculateTargetDepth(const ChunkCoord& coord, const math::Vec3& playerPos) const;
-    
-    // Chunk file management
+    // File operations
     std::string getChunkFilename(const ChunkCoord& coord) const;
-    std::string getSuperChunkDirectory(const SuperChunkCoord& coord) const;
+    bool tryLoadFromFile(Chunk& chunk, uint32_t depth);
+    void saveChunkToFile(const Chunk& chunk);
 };
 
 } // namespace voxels

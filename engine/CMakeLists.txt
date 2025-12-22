@@ -8,14 +8,16 @@ add_library(engine_math
 
 # Voxels library
 add_library(engine_voxels
-    voxels/svo.cpp
+    voxels/tree27.cpp
     voxels/chunk.cpp
+    voxels/chunk_array.cpp
     voxels/chunk_manager.cpp
-    voxels/super_chunk.cpp
-    voxels/svo.h
+    voxels/world_tree.cpp
+    voxels/tree27.h
     voxels/chunk.h
+    voxels/chunk_array.h
     voxels/chunk_manager.h
-    voxels/super_chunk.h
+    voxels/world_tree.h
     voxels/world_constants.h
 )
 

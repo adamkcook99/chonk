@@ -1,450 +1,239 @@
 #include "chunk_manager.h"
-#include "world_constants.h"
 #include "../../game/world/world_generator.h"
-#include "../networking/network.h"
 #include "../core/logging.h"
-#include <algorithm>
-#include <cmath>
-#include <cstring>
 #include <filesystem>
+#include <algorithm>
+#include <cstring>
 
 namespace chonk {
 namespace voxels {
 
-ChunkManager::ChunkManager() : superChunkCache(TOTAL_SUPER_CHUNKS + 25) {
+ChunkManager::ChunkManager() 
+    : loadQueue([](const ChunkArray::ChunkLoadInfo& a, const ChunkArray::ChunkLoadInfo& b) {
+        return a.priority > b.priority;  // Min-heap: lower priority first
+    })
+{
 }
 
 ChunkManager::~ChunkManager() {
     shutdown();
 }
 
-void ChunkManager::initialize(game::world::WorldGenerator* generator) {
-    worldGenerator = generator;
-    running = true;
+// ============================================================================
+// Initialization
+// ============================================================================
+
+void ChunkManager::initialize(game::world::WorldGenerator* gen) {
+    generator = gen;
     
-    // Start multiple load threads for faster chunk generation
+    // Create chunk directory if needed
+    std::filesystem::create_directories(chunkDirectory);
+    
+    // Initialize world tree centered at origin
+    worldTree.initialize(math::Vec3(0, GROUND_LEVEL, 0));
+    
+    // Pre-allocate GPU update buffers
+    gpuUpdateFront.metas.resize(CHUNK_ARRAY_TOTAL);
+    gpuUpdateBack.metas.resize(CHUNK_ARRAY_TOTAL);
+    gpuUpdateFront.nodes.reserve(CHUNK_ARRAY_TOTAL * 100);  // Estimate initial capacity
+    gpuUpdateBack.nodes.reserve(CHUNK_ARRAY_TOTAL * 100);
+    
+    // Start worker threads
+    running = true;
+    loadThreads.reserve(NUM_LOAD_THREADS);
     for (int i = 0; i < NUM_LOAD_THREADS; ++i) {
         loadThreads.emplace_back(&ChunkManager::loadThreadFunc, this);
     }
-    refineThread = std::thread(&ChunkManager::refineThreadFunc, this);
     
-    LOG_INFO("ChunkManager initialized with " + std::to_string(NUM_LOAD_THREADS) + " load threads");
+    // Start GPU update worker
+    startGPUUpdateWorker();
+    
+    LOG_INFO("ChunkManager initialized with " + std::to_string(NUM_LOAD_THREADS) + " load threads + 1 GPU update thread");
 }
 
 void ChunkManager::shutdown() {
-    if (running) {
-        running = false;
-        loadCondition.notify_all();
-        refineCondition.notify_all();
-        
-        for (auto& thread : loadThreads) {
-            if (thread.joinable()) {
-                thread.join();
-            }
-        }
-        loadThreads.clear();
-        
-        if (refineThread.joinable()) {
-            refineThread.join();
-        }
-    }
+    // Stop GPU update worker first
+    stopGPUUpdateWorker();
     
-    // Save all chunks
-    std::lock_guard<std::mutex> lock(cacheMutex);
-    for (auto* super : superChunkCache.getAll()) {
-        std::string superDir = getSuperChunkDirectory(super->getCoord());
-        std::filesystem::create_directories(superDir);
-        
-        for (auto* chunk : super->getLoadedChunks()) {
-            std::string filename = getChunkFilename(chunk->getCoord());
-            chunk->saveToFile(filename);
+    // Stop load worker threads
+    {
+        std::lock_guard<std::mutex> lock(loadQueueMutex);
+        running = false;
+    }
+    loadCondition.notify_all();
+    
+    for (auto& thread : loadThreads) {
+        if (thread.joinable()) {
+            thread.join();
         }
     }
+    loadThreads.clear();
+    
+    LOG_INFO("ChunkManager shutdown");
 }
 
-uint32_t ChunkManager::calculateTargetDepth(const ChunkCoord& coord, const math::Vec3& playerPos) const {
-    math::Vec3 chunkCenter = coord.toWorldPos() + 
-                              math::Vec3(CHUNK_SIZE_METERS * 0.5f, 
-                                         CHUNK_SIZE_METERS * 0.5f, 
-                                         CHUNK_SIZE_METERS * 0.5f);
-    float distance = (chunkCenter - playerPos).length();
-    
-    // Get render depth and add 1 for buffer
-    uint32_t renderDepth = getMaxDepthForDistance(distance);
-    return std::min(renderDepth + 1, CHUNK_SVO_DEPTH);
-}
+// ============================================================================
+// Update
+// ============================================================================
 
 void ChunkManager::update(const math::Vec3& playerPos, uint32_t frame) {
     currentFrame = frame;
+    
+    // Get current player chunk coordinate
+    ChunkCoord playerChunkCoord = ChunkCoord::fromWorldPos(playerPos);
+    
+    // Check if player moved to a new chunk
+    bool needsRecenter = firstUpdate || playerChunkCoord != lastPlayerChunkCoord;
+    
+    if (needsRecenter) {
+        std::vector<ChunkCoord> needsLoading;
+        size_t lodUpgradeCount = 0;
+        
+        // Take exclusive lock during recenter and LOD check
+        {
+            std::unique_lock<std::shared_mutex> arrayLock(chunkArrayMutex);
+            
+            // Recenter chunk array on player's chunk
+            needsLoading = chunkArray.recenter(playerChunkCoord);
+            
+            // Mark that we need a full GPU update (array shifted)
+            if (!needsLoading.empty()) {
+                fullGPUUpdateNeeded = true;
+            }
+            
+            // Queue new chunks that need loading
+            for (const auto& coord : needsLoading) {
+                uint32_t ix, iy, iz;
+                if (chunkArray.chunkCoordToIndex(coord, ix, iy, iz)) {
+                    ChunkArray::ChunkLoadInfo info;
+                    info.coord = coord;
+                    info.ix = ix;
+                    info.iy = iy;
+                    info.iz = iz;
+                    info.requiredDepth = chunkArray.getRequiredDepth(ix, iy, iz);
+                    
+                    int32_t dx = static_cast<int32_t>(ix) - static_cast<int32_t>(CHUNK_ARRAY_CENTER);
+                    int32_t dy = static_cast<int32_t>(iy) - static_cast<int32_t>(CHUNK_ARRAY_CENTER);
+                    int32_t dz = static_cast<int32_t>(iz) - static_cast<int32_t>(CHUNK_ARRAY_CENTER);
+                    info.priority = std::sqrt(static_cast<float>(dx*dx + dy*dy + dz*dz));
+                    
+                    queueChunkLoad(info);
+                }
+            }
+            
+            // Check existing chunks for LOD upgrades (chunks that moved closer)
+            for (uint32_t z = 0; z < CHUNK_ARRAY_SIZE; z++) {
+                for (uint32_t y = 0; y < CHUNK_ARRAY_SIZE; y++) {
+                    for (uint32_t x = 0; x < CHUNK_ARRAY_SIZE; x++) {
+                        const Chunk* chunk = chunkArray.getByIndex(x, y, z);
+                        if (chunk && chunk->isLoaded()) {
+                            uint32_t requiredDepth = chunkArray.getRequiredDepth(x, y, z);
+                            
+                            // Need LOD upgrade?
+                            if (chunk->getCurrentDepth() < requiredDepth) {
+                                ChunkArray::ChunkLoadInfo info;
+                                info.coord = chunkArray.indexToChunkCoord(x, y, z);
+                                info.ix = x;
+                                info.iy = y;
+                                info.iz = z;
+                                info.requiredDepth = requiredDepth;
+                                
+                                int32_t dx = static_cast<int32_t>(x) - static_cast<int32_t>(CHUNK_ARRAY_CENTER);
+                                int32_t dy = static_cast<int32_t>(y) - static_cast<int32_t>(CHUNK_ARRAY_CENTER);
+                                int32_t dz = static_cast<int32_t>(z) - static_cast<int32_t>(CHUNK_ARRAY_CENTER);
+                                info.priority = std::sqrt(static_cast<float>(dx*dx + dy*dy + dz*dz));
+                                
+                                queueChunkLoad(info);
+                                lodUpgradeCount++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        lastPlayerChunkCoord = playerChunkCoord;
+        firstUpdate = false;
+        
+        if (!needsLoading.empty() || lodUpgradeCount > 0) {
+            LOG_INFO("Recentered on chunk " + playerChunkCoord.toString() + 
+                     ", queued " + std::to_string(needsLoading.size()) + " new + " +
+                     std::to_string(lodUpgradeCount) + " LOD upgrades");
+        }
+    }
+    
+    // Process any completed chunks (this will mark dirty slots)
+    processCompletedChunks();
+    
+    // Trigger GPU update if needed
+    if (fullGPUUpdateNeeded || !dirtyChunkSlots.empty()) {
+        triggerGPUUpdate(fullGPUUpdateNeeded);
+        fullGPUUpdateNeeded = false;
+    }
+    
     lastPlayerPos = playerPos;
-    
-    SuperChunkCoord playerSuperCoord = SuperChunkCoord::fromWorldPos(playerPos);
-    
-    // Get required super chunks (5x5x5 around player)
-    std::vector<SuperChunkCoord> requiredSupers = getRequiredSuperChunks(playerPos);
-    
-    {
-        std::lock_guard<std::mutex> lock(cacheMutex);
-        
-        // Ensure all required super chunks exist
-        for (const auto& superCoord : requiredSupers) {
-            SuperChunk* super = getOrCreateSuperChunk(superCoord);
-            if (super) {
-                superChunkCache.touch(superCoord, frame);
-            }
-        }
-    }
-    
-    // Queue chunks for loading and refinement
-    {
-        std::lock_guard<std::mutex> queueLock(loadQueueMutex);
-        std::lock_guard<std::mutex> refineLock(refineQueueMutex);
-        
-        for (const auto& superCoord : requiredSupers) {
-            std::vector<ChunkCoord> neededChunks = getRequiredChunksInSuper(superCoord, playerPos);
-            
-            for (const auto& chunkCoord : neededChunks) {
-                float priority = calculateLoadPriority(chunkCoord, playerPos);
-                uint32_t targetDepth = calculateTargetDepth(chunkCoord, playerPos);
-                
-                // Check if already loaded
-                Chunk* existingChunk = nullptr;
-                {
-                    std::lock_guard<std::mutex> cacheLock(cacheMutex);
-                    SuperChunk* super = superChunkCache.get(superCoord);
-                    if (super) {
-                        ChunkCoord first = superCoord.getFirstChunkCoord();
-                        uint32_t lx = chunkCoord.x - first.x;
-                        uint32_t ly = chunkCoord.y - first.y;
-                        uint32_t lz = chunkCoord.z - first.z;
-                        existingChunk = super->getChunk(lx, ly, lz);
-                    }
-                }
-                
-                if (existingChunk) {
-                    // Chunk exists - check if it needs refinement
-                    if (existingChunk->hasMoreDetail() && 
-                        existingChunk->getCurrentDepth() < targetDepth &&
-                        pendingRefines.find(chunkCoord) == pendingRefines.end()) {
-                        queueChunkRefine(chunkCoord, superCoord, targetDepth, priority);
-                    }
-                } else {
-                    // Chunk doesn't exist - queue for loading
-                    if (pendingLoads.find(chunkCoord) == pendingLoads.end()) {
-                        queueChunkLoad(chunkCoord, superCoord, targetDepth, priority);
-                    }
-                }
-            }
-        }
-    }
-    
-    // Log queue sizes periodically
-    static uint32_t updateCount = 0;
-    updateCount++;
-    if (updateCount == 1 || updateCount % 500 == 0) {
-        std::lock_guard<std::mutex> queueLock2(loadQueueMutex);
-        LOG_INFO("Update " + std::to_string(updateCount) + 
-                 ": " + std::to_string(pendingLoads.size()) + " pending loads");
-    }
-    
-    loadCondition.notify_all();  // Wake all load threads
-    refineCondition.notify_one();
-    lastPlayerSuperChunk = playerSuperCoord;
 }
 
-std::vector<SuperChunkCoord> ChunkManager::getRequiredSuperChunks(const math::Vec3& playerPos) const {
-    std::vector<SuperChunkCoord> result;
-    SuperChunkCoord center = SuperChunkCoord::fromWorldPos(playerPos);
-
-    // Keep current horizontal radius (e.g., 5×5 if SUPER_CHUNKS_PER_AXIS=5)
-    int radius = SUPER_CHUNKS_PER_AXIS / 2; // was 2 for 5x5
-
-    // Vertical: one layer below the player, the player layer, and all above up to the top
-    int minY = std::max(0, center.y - 1);
-    int maxY = static_cast<int>(WORLD_HEIGHT_METERS / SUPER_CHUNK_SIZE_METERS) - 1; // e.g., 4 for 10240/2048
-
-    for (int y = minY; y <= maxY; ++y) {
-        for (int dz = -radius; dz <= radius; ++dz) {
-            for (int dx = -radius; dx <= radius; ++dx) {
-                result.push_back(SuperChunkCoord(center.x + dx, y, center.z + dz));
-            }
-        }
-    }
-    return result;
-}
-
-std::vector<ChunkCoord> ChunkManager::getRequiredChunksInSuper(const SuperChunkCoord& superCoord, 
-                                                               const math::Vec3& playerPos) const {
-    std::vector<ChunkCoord> result;
-    
-    ChunkCoord first = superCoord.getFirstChunkCoord();
-    
-    for (uint32_t z = 0; z < CHUNKS_PER_SUPER_AXIS; ++z) {
-        for (uint32_t y = 0; y < CHUNKS_PER_SUPER_AXIS; ++y) {
-            for (uint32_t x = 0; x < CHUNKS_PER_SUPER_AXIS; ++x) {
-                ChunkCoord coord(first.x + x, first.y + y, first.z + z);
-                
-                math::Vec3 chunkCenter = coord.toWorldPos() + 
-                                          math::Vec3(CHUNK_SIZE_METERS * 0.5f, 
-                                                     CHUNK_SIZE_METERS * 0.5f, 
-                                                     CHUNK_SIZE_METERS * 0.5f);
-                float dist = (chunkCenter - playerPos).length();
-                
-                if (dist <= VIEW_DISTANCE_METERS) {
-                    result.push_back(coord);
-                }
-            }
-        }
-    }
-    
-    return result;
-}
-
-SuperChunk* ChunkManager::getOrCreateSuperChunk(const SuperChunkCoord& coord) {
-    SuperChunk* existing = superChunkCache.get(coord);
-    if (existing) {
-        return existing;
-    }
-    
-    auto newSuper = std::make_unique<SuperChunk>(coord);
-    SuperChunk* ptr = newSuper.get();
-    superChunkCache.add(std::move(newSuper));
-    
-    return ptr;
-}
-
-float ChunkManager::calculateLoadPriority(const ChunkCoord& coord, const math::Vec3& playerPos) const {
-    math::Vec3 chunkCenter = coord.toWorldPos() + 
-                              math::Vec3(CHUNK_SIZE_METERS * 0.5f, 
-                                         CHUNK_SIZE_METERS * 0.5f, 
-                                         CHUNK_SIZE_METERS * 0.5f);
-    return (chunkCenter - playerPos).length();
-}
-
-void ChunkManager::queueChunkLoad(const ChunkCoord& coord, const SuperChunkCoord& superCoord, 
-                                   uint32_t targetDepth, float priority) {
-    if (pendingLoads.find(coord) != pendingLoads.end()) {
-        return;
-    }
-    
-    // Limit queue size to prevent memory issues
-    if (pendingLoads.size() >= 500) {
-        return;  // Skip, will be queued on next update
-    }
-    
-    loadQueue.push({coord, superCoord, targetDepth, priority});
-    pendingLoads.insert(coord);
-}
-
-void ChunkManager::queueChunkRefine(const ChunkCoord& coord, const SuperChunkCoord& superCoord,
-                                     uint32_t targetDepth, float priority) {
-    if (pendingRefines.find(coord) != pendingRefines.end()) {
-        return;
-    }
-    
-    refineQueue.push({coord, superCoord, targetDepth, priority});
-    pendingRefines.insert(coord);
-}
-
-void ChunkManager::loadThreadFunc() {
-    static uint32_t chunksGenerated = 0;
-    
-    while (running) {
-        ChunkLoadRequest request;
-        bool hasWork = false;
-        
-        {
-            std::unique_lock<std::mutex> lock(loadQueueMutex);
-            loadCondition.wait_for(lock, std::chrono::milliseconds(50), [this] {
-                return !loadQueue.empty() || !running;
-            });
-            
-            if (!running) break;
-            
-            if (!loadQueue.empty()) {
-                request = loadQueue.top();
-                loadQueue.pop();
-                pendingLoads.erase(request.coord);
-                hasWork = true;
-            }
-        }
-        
-        if (hasWork) {
-            SuperChunk* super = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(cacheMutex);
-                super = getOrCreateSuperChunk(request.superCoord);
-            }
-            
-            if (!super) continue;
-            
-            ChunkCoord first = request.superCoord.getFirstChunkCoord();
-            uint32_t lx = request.coord.x - first.x;
-            uint32_t ly = request.coord.y - first.y;
-            uint32_t lz = request.coord.z - first.z;
-            
-            {
-                std::lock_guard<std::mutex> lock(cacheMutex);
-                if (super->getChunk(lx, ly, lz) != nullptr) {
-                    continue;
-                }
-            }
-            
-            std::string filename = getChunkFilename(request.coord);
-            auto chunk = std::make_unique<Chunk>(request.coord);
-            
-            if (!chunk->loadFromFile(filename)) {
-                // Generate at target depth (renderDepth + 1)
-                chunk->generate(worldGenerator, request.targetDepth);
-                
-                chunksGenerated++;
-                if (chunksGenerated <= 10 || chunksGenerated % 50 == 0) {
-                    LOG_INFO("Generated chunk " + request.coord.toString() + 
-                             " at depth " + std::to_string(request.targetDepth) +
-                             " (total: " + std::to_string(chunksGenerated) + ")");
-                }
-                
-                std::string superDir = getSuperChunkDirectory(request.superCoord);
-                std::filesystem::create_directories(superDir);
-                chunk->saveToFile(filename);
-            }
-            
-            {
-                std::lock_guard<std::mutex> lock(cacheMutex);
-                super->setChunk(lx, ly, lz, std::move(chunk));
-            }
-        }
-    }
-}
-
-void ChunkManager::refineThreadFunc() {
-    while (running) {
-        ChunkRefineRequest request;
-        bool hasWork = false;
-        
-        {
-            std::unique_lock<std::mutex> lock(refineQueueMutex);
-            refineCondition.wait_for(lock, std::chrono::milliseconds(100), [this] {
-                return !refineQueue.empty() || !running;
-            });
-            
-            if (!running) break;
-            
-            if (!refineQueue.empty()) {
-                request = refineQueue.top();
-                refineQueue.pop();
-                pendingRefines.erase(request.coord);
-                hasWork = true;
-            }
-        }
-        
-        if (hasWork) {
-            SuperChunk* super = nullptr;
-            Chunk* chunk = nullptr;
-            
-            {
-                std::lock_guard<std::mutex> lock(cacheMutex);
-                super = superChunkCache.get(request.superCoord);
-                if (super) {
-                    ChunkCoord first = request.superCoord.getFirstChunkCoord();
-                    uint32_t lx = request.coord.x - first.x;
-                    uint32_t ly = request.coord.y - first.y;
-                    uint32_t lz = request.coord.z - first.z;
-                    chunk = super->getChunk(lx, ly, lz);
-                }
-            }
-            
-            if (!chunk || !chunk->hasMoreDetail()) continue;
-            if (chunk->getCurrentDepth() >= request.targetDepth) continue;
-            
-            // Refine the chunk to the new depth
-            chunk->refineDetail(worldGenerator, request.targetDepth);
-            
-            // Save updated chunk
-            std::string filename = getChunkFilename(request.coord);
-            chunk->saveToFile(filename);
-        }
-    }
-}
+// ============================================================================
+// Chunk Access
+// ============================================================================
 
 Chunk* ChunkManager::getChunkAtWorld(const math::Vec3& worldPos) {
-    SuperChunkCoord superCoord = SuperChunkCoord::fromWorldPos(worldPos);
-    
-    std::lock_guard<std::mutex> lock(cacheMutex);
-    SuperChunk* super = superChunkCache.get(superCoord);
-    if (!super) return nullptr;
-    
-    return super->getChunkAtWorldPos(worldPos);
+    return chunkArray.getByWorldPos(worldPos);
 }
 
 const Chunk* ChunkManager::getChunkAtWorld(const math::Vec3& worldPos) const {
-    return const_cast<ChunkManager*>(this)->getChunkAtWorld(worldPos);
+    return chunkArray.getByWorldPos(worldPos);
 }
 
-std::vector<ChunkManager::ChunkRenderInfo> ChunkManager::getChunksForRendering(
-    const math::Vec3& cameraPos, const math::Vec3& cameraDir, float fov) const {
-    
-    std::vector<ChunkRenderInfo> result;
-    result.reserve(1000);
-    
-    math::Vec3 camDirNorm = cameraDir.normalize();
-    
-    std::lock_guard<std::mutex> lock(cacheMutex);
-    
-    for (const SuperChunk* super : superChunkCache.getAll()) {
-        math::Vec3 superCenter = super->getWorldPosition() + 
-                                  math::Vec3(SUPER_CHUNK_SIZE_METERS * 0.5f, 
-                                             SUPER_CHUNK_SIZE_METERS * 0.5f, 
-                                             SUPER_CHUNK_SIZE_METERS * 0.5f);
-        math::Vec3 toSuper = (superCenter - cameraPos).normalize();
-        float superDot = camDirNorm.dot(toSuper);
-        float superDist = (superCenter - cameraPos).length();
-        
-        if (superDot < -0.3f && superDist > SUPER_CHUNK_SIZE_METERS * 2) {
-            continue;
-        }
-        
-        for (const Chunk* chunk : super->getLoadedChunks()) {
-            if (!chunk || chunk->isAir()) continue;
-            
-            math::Vec3 chunkCenter = chunk->getWorldPosition() + 
-                                      math::Vec3(CHUNK_SIZE_METERS * 0.5f, 
-                                                 CHUNK_SIZE_METERS * 0.5f, 
-                                                 CHUNK_SIZE_METERS * 0.5f);
-            float distance = (chunkCenter - cameraPos).length();
-            
-            if (distance > VIEW_DISTANCE_METERS) continue;
-            
-            math::Vec3 toChunk = (chunkCenter - cameraPos).normalize();
-            float dot = camDirNorm.dot(toChunk);
-            
-            if (dot < -0.2f && distance > CHUNK_SIZE_METERS * 2) {
-                continue;
-            }
-            
-            uint32_t maxDepth = getMaxDepthForDistance(distance);
-            uint32_t availableDepth = chunk->getCurrentDepth();
-            
-            result.push_back({chunk, maxDepth, availableDepth, distance});
-        }
+Chunk* ChunkManager::getChunkByCoord(const ChunkCoord& coord) {
+    return chunkArray.getByChunkCoord(coord);
+}
+
+const Chunk* ChunkManager::getChunkByCoord(const ChunkCoord& coord) const {
+    return chunkArray.getByChunkCoord(coord);
+}
+
+// ============================================================================
+// Material Query
+// ============================================================================
+
+uint8_t ChunkManager::getMaterialAtWorld(const math::Vec3& worldPos) const {
+    // First try chunk array
+    const Chunk* chunk = chunkArray.getByWorldPos(worldPos);
+    if (chunk && chunk->isLoaded()) {
+        return chunk->getMaterialAtWorld(worldPos);
     }
     
-    std::sort(result.begin(), result.end(), 
-              [](const auto& a, const auto& b) { return a.distance < b.distance; });
-    
-    return result;
+    // Fall back to world tree for distant terrain
+    return worldTree.getMaterialAtWorld(worldPos);
 }
+
+// ============================================================================
+// Rendering Data
+// ============================================================================
 
 std::vector<const Chunk*> ChunkManager::getAllLoadedChunks() const {
-    std::vector<const Chunk*> result;
-    result.reserve(1000);
+    return chunkArray.getAllLoadedChunks();
+}
+
+std::vector<ChunkManager::GPUChunkData> ChunkManager::getChunksForGPU() const {
+    std::vector<GPUChunkData> result;
+    result.reserve(CHUNK_ARRAY_TOTAL);
     
-    std::lock_guard<std::mutex> lock(cacheMutex);
-    
-    for (const SuperChunk* super : superChunkCache.getAll()) {
-        for (const Chunk* chunk : super->getLoadedChunks()) {
-            if (chunk && !chunk->isAir()) {
-                result.push_back(chunk);
+    for (uint32_t z = 0; z < CHUNK_ARRAY_SIZE; z++) {
+        for (uint32_t y = 0; y < CHUNK_ARRAY_SIZE; y++) {
+            for (uint32_t x = 0; x < CHUNK_ARRAY_SIZE; x++) {
+                const Chunk* chunk = chunkArray.getByIndex(x, y, z);
+                if (chunk && chunk->isLoaded()) {
+                    GPUChunkData data;
+                    data.chunk = chunk;
+                    data.maxDepth = chunk->getCurrentDepth();
+                    data.arrayIndexX = x;
+                    data.arrayIndexY = y;
+                    data.arrayIndexZ = z;
+                    result.push_back(data);
+                }
             }
         }
     }
@@ -452,42 +241,48 @@ std::vector<const Chunk*> ChunkManager::getAllLoadedChunks() const {
     return result;
 }
 
-std::vector<Chunk*> ChunkManager::getSimulationChunks() {
-    std::vector<Chunk*> result;
+// ============================================================================
+// Network Integration
+// ============================================================================
+
+void ChunkManager::addChunkFromNetwork(const ChunkCoord& coord, const std::vector<uint8_t>& data, uint32_t depth) {
+    uint32_t ix, iy, iz;
     
-    SuperChunkCoord centerSuper = SuperChunkCoord::fromWorldPos(lastPlayerPos);
+    // Take exclusive lock while modifying chunk array
+    std::unique_lock<std::shared_mutex> arrayLock(chunkArrayMutex);
     
-    std::lock_guard<std::mutex> lock(cacheMutex);
-    SuperChunk* super = superChunkCache.get(centerSuper);
-    if (super) {
-        result = super->getLoadedChunks();
+    if (!chunkArray.chunkCoordToIndex(coord, ix, iy, iz)) {
+        return;  // Out of bounds
     }
     
-    return result;
+    auto chunk = std::make_unique<Chunk>(coord);
+    chunk->deserialize(data.data(), data.size(), depth);
+    
+    // Add to world tree
+    worldTree.updateFromChunk(*chunk);
+    
+    // Place in array
+    chunkArray.setChunk(ix, iy, iz, std::move(chunk));
+    
+    // Mark dirty for GPU update
+    uint32_t flatIdx = ix + iy * CHUNK_ARRAY_SIZE + iz * CHUNK_ARRAY_SIZE * CHUNK_ARRAY_SIZE;
+    dirtyChunkSlots.insert(flatIdx);
+    
+    arrayLock.unlock();
+    
+    // Remove from pending
+    {
+        std::lock_guard<std::mutex> lock(loadQueueMutex);
+        pendingLoads.erase(coord);
+    }
 }
 
-uint8_t ChunkManager::getMaterialAtWorld(const math::Vec3& worldPos, const math::Vec3& cameraPos) const {
-    const Chunk* chunk = getChunkAtWorld(worldPos);
-    if (!chunk) return 0;
-    
-    float distance = (worldPos - cameraPos).length();
-    uint32_t maxDepth = getMaxDepthForDistance(distance);
-    
-    return chunk->getMaterialAtWorld(worldPos, maxDepth);
-}
+// ============================================================================
+// Statistics
+// ============================================================================
 
 size_t ChunkManager::getLoadedChunkCount() const {
-    size_t count = 0;
-    std::lock_guard<std::mutex> lock(cacheMutex);
-    for (const SuperChunk* super : superChunkCache.getAll()) {
-        count += super->getLoadedChunkCount();
-    }
-    return count;
-}
-
-size_t ChunkManager::getLoadedSuperChunkCount() const {
-    std::lock_guard<std::mutex> lock(cacheMutex);
-    return superChunkCache.size();
+    return chunkArray.getLoadedCount();
 }
 
 size_t ChunkManager::getPendingLoadCount() const {
@@ -495,75 +290,378 @@ size_t ChunkManager::getPendingLoadCount() const {
     return pendingLoads.size();
 }
 
-size_t ChunkManager::getPendingRefineCount() const {
-    std::lock_guard<std::mutex> lock(refineQueueMutex);
-    return pendingRefines.size();
+// ============================================================================
+// Async Loading
+// ============================================================================
+
+void ChunkManager::queueChunkLoad(const ChunkArray::ChunkLoadInfo& info) {
+    std::lock_guard<std::mutex> lock(loadQueueMutex);
+    
+    // Check if already pending
+    auto it = pendingLoads.find(info.coord);
+    if (it != pendingLoads.end()) {
+        // Already pending - check if we need a higher depth
+        if (info.requiredDepth > it->second) {
+            // Upgrade the pending depth - add new queue entry
+            // (old entries will be filtered out in loadThreadFunc)
+            it->second = info.requiredDepth;
+            loadQueue.push(info);
+            loadCondition.notify_one();
+        }
+        return;
+    }
+    
+    // Skip if already loaded at sufficient depth
+    // Note: This read is safe because we're called from update() which holds the array lock
+    // or the check is best-effort (load thread will verify again)
+    const Chunk* existing = chunkArray.getByIndex(info.ix, info.iy, info.iz);
+    if (existing && existing->isLoaded() && existing->getCurrentDepth() >= info.requiredDepth) {
+        return;
+    }
+    
+    pendingLoads[info.coord] = info.requiredDepth;
+    loadQueue.push(info);
+    loadCondition.notify_one();
 }
+
+void ChunkManager::loadThreadFunc() {
+    while (true) {
+        ChunkArray::ChunkLoadInfo info;
+        
+        {
+            std::unique_lock<std::mutex> lock(loadQueueMutex);
+            loadCondition.wait(lock, [this] {
+                return !running || !loadQueue.empty();
+            });
+            
+            if (!running && loadQueue.empty()) {
+                return;
+            }
+            
+            if (loadQueue.empty()) {
+                continue;
+            }
+            
+            info = loadQueue.top();
+            loadQueue.pop();
+            
+            // Check if this request has been superseded by a higher depth request
+            auto pendingIt = pendingLoads.find(info.coord);
+            if (pendingIt != pendingLoads.end() && pendingIt->second > info.requiredDepth) {
+                // A higher depth request is pending - skip this one
+                continue;
+            }
+        }
+        
+        // Verify chunk is still needed (player might have moved)
+        // Take shared lock for reading chunk array state
+        {
+            std::shared_lock<std::shared_mutex> arrayLock(chunkArrayMutex);
+            
+            ChunkCoord currentCenter = chunkArray.getCenter();
+            int32_t dx = info.coord.x - currentCenter.x;
+            int32_t dy = info.coord.y - currentCenter.y;
+            int32_t dz = info.coord.z - currentCenter.z;
+            
+            // Check if chunk is still in bounds
+            bool stillNeeded = (std::abs(dx) < static_cast<int32_t>(CHUNK_ARRAY_SIZE / 2) &&
+                                std::abs(dy) < static_cast<int32_t>(CHUNK_ARRAY_SIZE / 2) &&
+                                std::abs(dz) < static_cast<int32_t>(CHUNK_ARRAY_SIZE / 2));
+            
+            if (!stillNeeded) {
+                // Chunk no longer needed - remove from pending without processing
+                arrayLock.unlock();
+                std::lock_guard<std::mutex> lock(loadQueueMutex);
+                pendingLoads.erase(info.coord);
+                continue;
+            }
+            
+            // Double-check that chunk isn't already loaded at sufficient depth
+            const Chunk* existing = chunkArray.getByIndex(info.ix, info.iy, info.iz);
+            if (existing && existing->isLoaded() && existing->getCurrentDepth() >= info.requiredDepth) {
+                // Already loaded at sufficient depth - check if we should remove from pending
+                arrayLock.unlock();
+                std::lock_guard<std::mutex> lock(loadQueueMutex);
+                auto pendingIt = pendingLoads.find(info.coord);
+                if (pendingIt != pendingLoads.end() && pendingIt->second <= info.requiredDepth) {
+                    pendingLoads.erase(pendingIt);
+                }
+                continue;
+            }
+        }
+        
+        // Generate or load chunk (outside of lock - this is the slow part)
+        auto chunk = std::make_unique<Chunk>(info.coord);
+        
+        // File loading disabled for now
+        // bool loaded = tryLoadFromFile(*chunk, info.requiredDepth);
+        bool loaded = false;
+        
+        if (!loaded && generator) {
+            // Generate new chunk at requested depth
+            generator->generateChunk(*chunk, info.requiredDepth);
+            
+            // File saving disabled for now
+            // if (info.requiredDepth > 0) {
+            //     saveChunkToFile(*chunk);
+            // }
+        } else if (loaded && chunk->getCurrentDepth() < info.requiredDepth && generator) {
+            // File had lower depth, upgrade it
+            generator->generateChunk(*chunk, info.requiredDepth);
+            // File saving disabled for now
+            // saveChunkToFile(*chunk);
+        }
+        
+        // Add to completed queue
+        {
+            std::lock_guard<std::mutex> lock(completedMutex);
+            CompletedChunk completed;
+            completed.chunk = std::move(chunk);
+            completed.ix = info.ix;
+            completed.iy = info.iy;
+            completed.iz = info.iz;
+            completed.depth = info.requiredDepth;
+            completedChunks.push(std::move(completed));
+        }
+    }
+}
+
+void ChunkManager::processCompletedChunks() {
+    std::lock_guard<std::mutex> lock(completedMutex);
+    
+    // Take exclusive lock on chunk array while modifying it
+    std::unique_lock<std::shared_mutex> arrayLock(chunkArrayMutex);
+    
+    // Process up to 100 completed chunks per frame (increased for faster loading)
+    int processed = 0;
+    while (!completedChunks.empty() && processed < 100) {
+        CompletedChunk& completed = completedChunks.front();
+        
+        // Verify chunk is still needed at this position
+        ChunkCoord expectedCoord = chunkArray.indexToChunkCoord(completed.ix, completed.iy, completed.iz);
+        
+        if (completed.chunk->getCoord() == expectedCoord) {
+            // Check if there's a higher depth pending - if so, don't overwrite with lower depth
+            bool shouldPlace = true;
+            {
+                std::lock_guard<std::mutex> loadLock(loadQueueMutex);
+                auto pendingIt = pendingLoads.find(expectedCoord);
+                if (pendingIt != pendingLoads.end() && pendingIt->second > completed.depth) {
+                    // A higher depth request is pending - don't place this lower-depth chunk
+                    shouldPlace = false;
+                } else if (pendingIt != pendingLoads.end() && pendingIt->second <= completed.depth) {
+                    // This completes or exceeds the pending request - remove from pending
+                    pendingLoads.erase(pendingIt);
+                }
+            }
+            
+            if (shouldPlace) {
+                // Place in array (fast operation)
+                chunkArray.setChunk(completed.ix, completed.iy, completed.iz, std::move(completed.chunk));
+                
+                // Mark this slot as dirty for GPU update
+                uint32_t flatIdx = completed.ix + 
+                                   completed.iy * CHUNK_ARRAY_SIZE + 
+                                   completed.iz * CHUNK_ARRAY_SIZE * CHUNK_ARRAY_SIZE;
+                dirtyChunkSlots.insert(flatIdx);
+            }
+        } else {
+            // Coord doesn't match - chunk was probably discarded during recenter
+            // Remove from pending if this was the expected depth
+            std::lock_guard<std::mutex> loadLock(loadQueueMutex);
+            auto pendingIt = pendingLoads.find(completed.chunk->getCoord());
+            if (pendingIt != pendingLoads.end() && pendingIt->second <= completed.depth) {
+                pendingLoads.erase(pendingIt);
+            }
+        }
+        
+        completedChunks.pop();
+        processed++;
+    }
+}
+
+// ============================================================================
+// File Operations
+// ============================================================================
 
 std::string ChunkManager::getChunkFilename(const ChunkCoord& coord) const {
-    SuperChunkCoord superCoord(
-        coord.x / static_cast<int32_t>(CHUNKS_PER_SUPER_AXIS),
-        coord.y / static_cast<int32_t>(CHUNKS_PER_SUPER_AXIS),
-        coord.z / static_cast<int32_t>(CHUNKS_PER_SUPER_AXIS)
-    );
-    return getSuperChunkDirectory(superCoord) + "/chunk_" + coord.toString() + ".bin";
+    return chunkDirectory + "/" + coord.toString() + ".chunk";
 }
 
-std::string ChunkManager::getSuperChunkDirectory(const SuperChunkCoord& coord) const {
-    return chunkDirectory + "/" + coord.toString();
+bool ChunkManager::tryLoadFromFile(Chunk& chunk, uint32_t depth) {
+    std::string filename = getChunkFilename(chunk.getCoord());
+    
+    if (!std::filesystem::exists(filename)) {
+        return false;
+    }
+    
+    if (!chunk.loadFromFile(filename)) {
+        return false;
+    }
+    
+    // Check if file has sufficient depth
+    if (chunk.getCurrentDepth() < depth) {
+        // Need to regenerate at higher detail
+        return false;
+    }
+    
+    return true;
 }
 
-void ChunkManager::addChunkFromNetwork(const ChunkCoord& coord, const std::vector<uint8_t>& data) {
-    if (data.size() < sizeof(networking::ChunkDataHeader)) {
-        return;
-    }
-    
-    const networking::ChunkDataHeader* header = 
-        reinterpret_cast<const networking::ChunkDataHeader*>(data.data());
-    
-    if (header->type != networking::MessageType::CHUNK_DATA) {
-        return;
-    }
-    
-    if (header->x != coord.x || header->y != coord.y || header->z != coord.z) {
-        return;
-    }
-    
-    size_t headerSize = sizeof(networking::ChunkDataHeader);
-    size_t nodeDataSize = header->nodeCount * sizeof(SVONode);
-    
-    if (data.size() < headerSize + nodeDataSize) {
-        return;
-    }
-    
-    std::vector<SVONode> nodes(header->nodeCount);
-    std::memcpy(nodes.data(), data.data() + headerSize, nodeDataSize);
-    
-    SuperChunkCoord superCoord(
-        coord.x / static_cast<int32_t>(CHUNKS_PER_SUPER_AXIS),
-        coord.y / static_cast<int32_t>(CHUNKS_PER_SUPER_AXIS),
-        coord.z / static_cast<int32_t>(CHUNKS_PER_SUPER_AXIS)
-    );
-    
-    std::lock_guard<std::mutex> lock(cacheMutex);
-    SuperChunk* super = getOrCreateSuperChunk(superCoord);
-    if (!super) return;
-    
-    ChunkCoord first = superCoord.getFirstChunkCoord();
-    uint32_t lx = coord.x - first.x;
-    uint32_t ly = coord.y - first.y;
-    uint32_t lz = coord.z - first.z;
-    
-    auto chunk = std::make_unique<Chunk>(coord);
-    chunk->getSVO().loadNodes(nodes);
-    chunk->setLoaded(true);
-    
-    super->setChunk(lx, ly, lz, std::move(chunk));
-    
+void ChunkManager::saveChunkToFile(const Chunk& chunk) {
+    std::string filename = getChunkFilename(chunk.getCoord());
+    chunk.saveToFile(filename);
+}
+
+// ============================================================================
+// GPU Update System
+// ============================================================================
+
+void ChunkManager::startGPUUpdateWorker() {
+    gpuUpdateRunning = true;
+    gpuUpdateThread = std::thread(&ChunkManager::gpuUpdateWorkerFunc, this);
+}
+
+void ChunkManager::stopGPUUpdateWorker() {
     {
-        std::lock_guard<std::mutex> queueLock(loadQueueMutex);
-        pendingLoads.erase(coord);
+        std::lock_guard<std::mutex> lock(gpuUpdateMutex);
+        gpuUpdateRunning = false;
     }
+    gpuUpdateCondition.notify_one();
+    
+    if (gpuUpdateThread.joinable()) {
+        gpuUpdateThread.join();
+    }
+}
+
+void ChunkManager::triggerGPUUpdate(bool fullUpdate) {
+    {
+        std::lock_guard<std::mutex> lock(gpuUpdateMutex);
+        if (fullUpdate) {
+            fullGPUUpdateNeeded = true;
+        }
+        // Dirty slots are already tracked
+    }
+    gpuUpdateCondition.notify_one();
+}
+
+void ChunkManager::gpuUpdateWorkerFunc() {
+    while (gpuUpdateRunning) {
+        bool needsFullUpdate = false;
+        
+        {
+            std::unique_lock<std::mutex> lock(gpuUpdateMutex);
+            gpuUpdateCondition.wait(lock, [this] {
+                return !gpuUpdateRunning || fullGPUUpdateNeeded || !dirtyChunkSlots.empty();
+            });
+            
+            if (!gpuUpdateRunning) {
+                return;
+            }
+            
+            // Consume the full update flag
+            needsFullUpdate = fullGPUUpdateNeeded;
+            fullGPUUpdateNeeded = false;  // Clear it after consuming
+        }
+        
+        // Collect GPU data with shared lock (doesn't block main thread writes)
+        collectGPUData(gpuUpdateFront, needsFullUpdate);
+        
+        // Swap buffers atomically
+        {
+            std::lock_guard<std::mutex> lock(gpuUpdateMutex);
+            std::swap(gpuUpdateFront, gpuUpdateBack);
+            gpuUpdateId++;
+            gpuUpdateReady = true;
+            dirtyChunkSlots.clear();
+        }
+    }
+}
+
+void ChunkManager::collectGPUData(GPUChunkUpdate& update, bool fullUpdate) {
+    update.nodes.clear();
+    update.updatedSlots.clear();
+    
+    // Take shared lock while reading chunk array - allows concurrent reads
+    // but blocks during writes (recenter, processCompletedChunks)
+    std::shared_lock<std::shared_mutex> arrayLock(chunkArrayMutex);
+    
+    // Get array origin (must be read under lock to match chunk data)
+    update.arrayOrigin = chunkArray.getArrayOrigin();
+    
+    // Ensure metas array is correctly sized
+    if (update.metas.size() != CHUNK_ARRAY_TOTAL) {
+        update.metas.resize(CHUNK_ARRAY_TOTAL);
+    }
+    
+    // Initialize all metas to empty if full update
+    if (fullUpdate) {
+        for (auto& meta : update.metas) {
+            meta.nodeOffset = 0;
+            meta.nodeCount = 0;
+            meta.maxDepth = 0;
+            meta.rootMaterial = 0;
+        }
+    }
+    
+    size_t loadedCount = 0;
+    
+    // Iterate through all chunks in the array
+    for (uint32_t z = 0; z < CHUNK_ARRAY_SIZE; z++) {
+        for (uint32_t y = 0; y < CHUNK_ARRAY_SIZE; y++) {
+            for (uint32_t x = 0; x < CHUNK_ARRAY_SIZE; x++) {
+                uint32_t flatIdx = x + y * CHUNK_ARRAY_SIZE + z * CHUNK_ARRAY_SIZE * CHUNK_ARRAY_SIZE;
+                
+                const Chunk* chunk = chunkArray.getByIndex(x, y, z);
+                if (chunk && chunk->isLoaded()) {
+                    const auto& nodes = chunk->getTree().getNodes();
+                    
+                    update.metas[flatIdx].nodeOffset = static_cast<uint32_t>(update.nodes.size());
+                    update.metas[flatIdx].nodeCount = static_cast<uint32_t>(nodes.size());
+                    update.metas[flatIdx].maxDepth = chunk->getCurrentDepth();
+                    update.metas[flatIdx].rootMaterial = chunk->getTree().getRootMaterial();
+                    
+                    // Append nodes
+                    update.nodes.insert(update.nodes.end(), nodes.begin(), nodes.end());
+                    update.updatedSlots.push_back(flatIdx);
+                    loadedCount++;
+                } else {
+                    // Empty chunk
+                    update.metas[flatIdx].nodeOffset = 0;
+                    update.metas[flatIdx].nodeCount = 0;
+                    update.metas[flatIdx].maxDepth = 0;
+                    update.metas[flatIdx].rootMaterial = 0;
+                }
+            }
+        }
+    }
+    
+    // Release lock before final processing
+    arrayLock.unlock();
+    
+    // Ensure at least one node exists for shader
+    if (update.nodes.empty()) {
+        Tree27Node emptyNode{};
+        std::memset(&emptyNode, 0, sizeof(Tree27Node));
+        update.nodes.push_back(emptyNode);
+    }
+    
+    update.loadedChunkCount = loadedCount;
+    update.updateId = gpuUpdateId + 1;
+    update.ready = true;
+}
+
+bool ChunkManager::hasGPUUpdate() const {
+    return gpuUpdateReady.load();
+}
+
+const GPUChunkUpdate* ChunkManager::getGPUUpdate() {
+    std::lock_guard<std::mutex> lock(gpuUpdateMutex);
+    if (!gpuUpdateReady) {
+        return nullptr;
+    }
+    gpuUpdateReady = false;
+    return &gpuUpdateBack;
 }
 
 } // namespace voxels

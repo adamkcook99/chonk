@@ -1,5 +1,6 @@
 #include "network.h"
 #include "../voxels/chunk.h"
+#include "../voxels/tree27.h"
 #include "../voxels/world_constants.h"
 #include "../math/vec3.h"
 #include "../core/logging.h"
@@ -131,12 +132,17 @@ void NetworkManager::processPacket(ENetEvent& event) {
             ChunkDataHeader* header = reinterpret_cast<ChunkDataHeader*>(event.packet->data);
             voxels::ChunkCoord coord(header->x, header->y, header->z);
             
-            // Pass the entire packet data (including header) to the callback
-            std::vector<uint8_t> data(event.packet->dataLength);
-            std::memcpy(data.data(), event.packet->data, event.packet->dataLength);
+            // Extract node data
+            size_t nodeDataOffset = sizeof(ChunkDataHeader);
+            size_t nodeDataSize = event.packet->dataLength - nodeDataOffset;
+            
+            std::vector<uint8_t> data(nodeDataSize);
+            if (nodeDataSize > 0) {
+                std::memcpy(data.data(), event.packet->data + nodeDataOffset, nodeDataSize);
+            }
             
             if (onChunkReceived) {
-                onChunkReceived(coord, data);
+                onChunkReceived(coord, data, header->actualDepth);
             }
             break;
         }
@@ -169,30 +175,85 @@ void NetworkManager::processPacket(ENetEvent& event) {
             break;
         }
         
+        case MessageType::CHUNK_REQUEST_LOD: {
+            if (event.packet->dataLength < sizeof(ChunkRequestLODMessage)) {
+                break;
+            }
+            
+            ChunkRequestLODMessage* msg = reinterpret_cast<ChunkRequestLODMessage*>(event.packet->data);
+            voxels::ChunkCoord coord(msg->x, msg->y, msg->z);
+            
+            if (onChunkRequestLODReceived) {
+                onChunkRequestLODReceived(event.peer, coord, msg->requestedDepth);
+            }
+            break;
+        }
+        
         default:
             break;
     }
 }
 
-void NetworkManager::broadcastChunk(const voxels::Chunk& chunk) {
+// ============================================================================
+// Server Functions
+// ============================================================================
+
+void NetworkManager::serializeChunk(const voxels::Chunk& chunk, uint32_t depth, std::vector<uint8_t>& data) {
+    const auto& tree = chunk.getTree();
+    
+    // Get nodes trimmed to requested depth
+    auto nodes = tree.getNodesTrimmedToDepth(depth);
+    
+    ChunkDataHeader header;
+    header.type = MessageType::CHUNK_DATA;
+    const auto& coord = chunk.getCoord();
+    header.x = coord.x;
+    header.y = coord.y;
+    header.z = coord.z;
+    header.nodeCount = static_cast<uint32_t>(nodes.size());
+    header.requestedDepth = depth;
+    header.actualDepth = std::min(depth, chunk.getCurrentDepth());
+    header.rootMaterial = tree.getRootMaterial();
+    header.rootFillPercent = tree.getRootFillPercent();
+    header._pad = 0;
+    
+    size_t headerSize = sizeof(ChunkDataHeader);
+    size_t nodeSize = nodes.size() * sizeof(voxels::Tree27Node);
+    data.resize(headerSize + nodeSize);
+    
+    std::memcpy(data.data(), &header, headerSize);
+    if (nodeSize > 0) {
+        std::memcpy(data.data() + headerSize, nodes.data(), nodeSize);
+    }
+}
+
+void NetworkManager::broadcastChunk(const voxels::Chunk& chunk, uint32_t depth) {
     if (!host || !serverMode) return;
     
     std::vector<uint8_t> data;
-    serializeChunk(chunk, data);
+    serializeChunk(chunk, depth, data);
     
     ENetPacket* packet = enet_packet_create(data.data(), data.size(), ENET_PACKET_FLAG_RELIABLE);
     enet_host_broadcast(host, 0, packet);
 }
 
-void NetworkManager::sendChunk(ENetPeer* peer, const voxels::Chunk& chunk) {
+void NetworkManager::sendChunk(ENetPeer* peer, const voxels::Chunk& chunk, uint32_t depth) {
     if (!host || !peer) return;
     
     std::vector<uint8_t> data;
-    serializeChunk(chunk, data);
+    serializeChunk(chunk, depth, data);
     
     ENetPacket* packet = enet_packet_create(data.data(), data.size(), ENET_PACKET_FLAG_RELIABLE);
     enet_peer_send(peer, 0, packet);
 }
+
+void NetworkManager::sendChunkAtLOD(ENetPeer* peer, const voxels::Chunk& chunk, uint32_t requestedDepth) {
+    sendChunk(peer, chunk, requestedDepth);
+}
+
+// ============================================================================
+// Client Functions
+// ============================================================================
 
 void NetworkManager::requestChunk(const voxels::ChunkCoord& coord) {
     if (!host || serverMode || !serverPeer) return;
@@ -202,6 +263,20 @@ void NetworkManager::requestChunk(const voxels::ChunkCoord& coord) {
     msg.x = coord.x;
     msg.y = coord.y;
     msg.z = coord.z;
+    
+    ENetPacket* packet = enet_packet_create(&msg, sizeof(msg), ENET_PACKET_FLAG_RELIABLE);
+    enet_peer_send(serverPeer, 0, packet);
+}
+
+void NetworkManager::requestChunkLOD(const voxels::ChunkCoord& coord, uint32_t depth) {
+    if (!host || serverMode || !serverPeer) return;
+    
+    ChunkRequestLODMessage msg;
+    msg.type = MessageType::CHUNK_REQUEST_LOD;
+    msg.x = coord.x;
+    msg.y = coord.y;
+    msg.z = coord.z;
+    msg.requestedDepth = depth;
     
     ENetPacket* packet = enet_packet_create(&msg, sizeof(msg), ENET_PACKET_FLAG_RELIABLE);
     enet_peer_send(serverPeer, 0, packet);
@@ -218,32 +293,6 @@ void NetworkManager::sendPlayerPosition(const math::Vec3& pos) {
     
     ENetPacket* packet = enet_packet_create(&msg, sizeof(msg), ENET_PACKET_FLAG_UNSEQUENCED);
     enet_peer_send(serverPeer, 0, packet);
-}
-
-void NetworkManager::serializeChunk(const voxels::Chunk& chunk, std::vector<uint8_t>& data) {
-    ChunkDataHeader header;
-    header.type = MessageType::CHUNK_DATA;
-    const voxels::ChunkCoord& coord = chunk.getCoord();
-    header.x = coord.x;
-    header.y = coord.y;
-    header.z = coord.z;
-    header.maxDepth = voxels::CHUNK_SVO_DEPTH;  // Full depth
-    
-    const auto& nodes = chunk.getSVO().getNodes();
-    header.nodeCount = static_cast<uint32_t>(nodes.size());
-    
-    if (nodes.empty()) {
-        LOG_WARNING("Serializing chunk " + coord.toString() + " with 0 nodes!");
-    }
-    
-    size_t headerSize = sizeof(ChunkDataHeader);
-    size_t nodeSize = nodes.size() * sizeof(voxels::SVONode);
-    data.resize(headerSize + nodeSize);
-    
-    std::memcpy(data.data(), &header, headerSize);
-    if (nodeSize > 0) {
-        std::memcpy(data.data() + headerSize, nodes.data(), nodeSize);
-    }
 }
 
 } // namespace networking

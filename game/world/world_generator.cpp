@@ -6,34 +6,62 @@ namespace chonk {
 namespace game {
 namespace world {
 
-WorldGenerator::WorldGenerator() {
+WorldGenerator::WorldGenerator()
+    : stoneHeight(voxels::STONE_HEIGHT)
+    , dirtHeight(voxels::DIRT_HEIGHT)
+    , grassHeight(voxels::GRASS_HEIGHT)
+{
 }
 
-uint8_t WorldGenerator::getMaterialAt(const math::Vec3& worldPos, float /*resolution*/) {
+// ============================================================================
+// Point Query
+// ============================================================================
+
+uint8_t WorldGenerator::getMaterialAt(const math::Vec3& worldPos) const {
     float y = worldPos.y;
     
-    // Generate layered terrain
-    // World height: 10240m
-    // Ground level around 5120m (middle of world)
-    //
-    // Stone: y < 4096m
-    // Dirt: 4096m <= y < 4864m (768m layer)
-    // Grass: 4864m <= y < 5120m (256m layer)
-    // Air: y >= 5120m
-    
-    if (y < voxels::STONE_HEIGHT) {
-        return 3; // Stone
-    } else if (y < voxels::DIRT_HEIGHT) {
-        return 2; // Dirt
-    } else if (y < voxels::GRASS_HEIGHT) {
-        return 1; // Grass
+    // Simple layered terrain
+    // Stone → Dirt → Grass → Air (from bottom to top)
+    if (y < stoneHeight) {
+        return voxels::MAT_STONE;
+    } else if (y < dirtHeight) {
+        return voxels::MAT_DIRT;
+    } else if (y < grassHeight) {
+        return voxels::MAT_GRASS;
     } else {
-        return 0; // Air
+        return voxels::MAT_AIR;
     }
 }
 
-void WorldGenerator::generateChunk(voxels::Chunk& chunk) {
-    chunk.generate(this);
+std::function<uint8_t(const math::Vec3&)> WorldGenerator::getTerrainFunction() const {
+    // Capture heights by value for thread safety
+    float stone = stoneHeight;
+    float dirt = dirtHeight;
+    float grass = grassHeight;
+    
+    return [stone, dirt, grass](const math::Vec3& pos) -> uint8_t {
+        float y = pos.y;
+        if (y < stone) return voxels::MAT_STONE;
+        else if (y < dirt) return voxels::MAT_DIRT;
+        else if (y < grass) return voxels::MAT_GRASS;
+        else return voxels::MAT_AIR;
+    };
+}
+
+// ============================================================================
+// Chunk Generation
+// ============================================================================
+
+void WorldGenerator::generateChunk(voxels::Chunk& chunk, uint32_t maxDepth) {
+    // Use the fast analytical path for layered terrain
+    // This never iterates through all voxels - only samples boundaries
+    chunk.generateLayered(maxDepth, stoneHeight, dirtHeight, grassHeight);
+}
+
+void WorldGenerator::generateChunkProcedural(voxels::Chunk& chunk, uint32_t maxDepth) {
+    // Use the generic procedural path (slower but flexible)
+    auto terrainFn = getTerrainFunction();
+    chunk.generateWithFunction(terrainFn, maxDepth);
 }
 
 } // namespace world

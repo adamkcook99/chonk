@@ -1,6 +1,8 @@
 #include "renderer.h"
 #include "../voxels/chunk.h"
-#include "../voxels/svo.h"
+#include "../voxels/chunk_array.h"
+#include "../voxels/chunk_manager.h"
+#include "../voxels/tree27.h"
 #include "../voxels/world_constants.h"
 #include "../math/vec3.h"
 #include "../core/logging.h"
@@ -564,7 +566,7 @@ void Renderer::createUniformBuffer() {
     // Initialize with default values
     UniformBufferData uboData{};
     std::memset(&uboData, 0, sizeof(UniformBufferData));
-    uboData.cameraRight[3] = 0.5f;  // FOV is packed in w component
+    uboData.cameraRightFov[3] = 0.5f;  // FOV is packed in w component
     uboData.sunDir[0] = 0.0f;
     uboData.sunDir[1] = 1.0f;  // Sun pointing up
     uboData.sunDir[2] = 0.0f;
@@ -727,7 +729,7 @@ void Renderer::createChunkBuffers(const std::vector<const voxels::Chunk*>& chunk
         vkUnmapMemory(device, chunkInfoBufferMemory);
         
         // Create empty chunk data buffer
-        VkDeviceSize dataBufferSize = sizeof(voxels::SVONode); // At least 1 node
+        VkDeviceSize dataBufferSize = sizeof(voxels::Tree27Node); // At least 1 node
         bufferInfo.size = dataBufferSize;
         bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         
@@ -747,8 +749,8 @@ void Renderer::createChunkBuffers(const std::vector<const voxels::Chunk*>& chunk
         vkBindBufferMemory(device, chunkDataBuffer, chunkDataBufferMemory, 0);
         
         // Initialize with empty node
-        voxels::SVONode emptyNode{};
-        std::memset(&emptyNode, 0, sizeof(voxels::SVONode));
+        voxels::Tree27Node emptyNode{};
+        std::memset(&emptyNode, 0, sizeof(voxels::Tree27Node));
         vkMapMemory(device, chunkDataBufferMemory, 0, dataBufferSize, 0, &data);
         std::memcpy(data, &emptyNode, dataBufferSize);
         vkUnmapMemory(device, chunkDataBufferMemory);
@@ -811,17 +813,17 @@ void Renderer::createChunkBuffers(const std::vector<const voxels::Chunk*>& chunk
         return; // Done with empty buffers
     }
     
-    // Collect all SVO nodes
+    // Collect all tree nodes
     size_t totalNodes = 0;
     std::vector<uint32_t> nodeOffsets;
     for (const auto* chunk : chunks) {
         nodeOffsets.push_back(static_cast<uint32_t>(totalNodes));
-        totalNodes += chunk->getSVO().getNodeCount();
+        totalNodes += chunk->getTree().getNodeCount();
     }
     
     // Create chunk data buffer
     if (totalNodes > 0) {
-        VkDeviceSize bufferSize = totalNodes * sizeof(voxels::SVONode);
+        VkDeviceSize bufferSize = totalNodes * sizeof(voxels::Tree27Node);
         
         VkBufferCreateInfo bufferInfo{};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -853,46 +855,23 @@ void Renderer::createChunkBuffers(const std::vector<const voxels::Chunk*>& chunk
         vkMapMemory(device, chunkDataBufferMemory, 0, bufferSize, 0, &data);
         size_t offset = 0;
         for (const auto* chunk : chunks) {
-            const auto& nodes = chunk->getSVO().getNodes();
-            std::memcpy(static_cast<char*>(data) + offset, nodes.data(), nodes.size() * sizeof(voxels::SVONode));
-            offset += nodes.size() * sizeof(voxels::SVONode);
+            const auto& nodes = chunk->getTree().getNodes();
+            std::memcpy(static_cast<char*>(data) + offset, nodes.data(), nodes.size() * sizeof(voxels::Tree27Node));
+            offset += nodes.size() * sizeof(voxels::Tree27Node);
         }
         vkUnmapMemory(device, chunkDataBufferMemory);
     }
     
-    // Create chunk info buffer - must match shader struct
-    struct ChunkInfo {
-        float aabbMin[4];   // xyz = min, w = unused
-        float aabbMax[4];   // xyz = max, w = chunk size
-        uint32_t nodeOffset;
-        uint32_t nodeCount;
-        uint32_t maxDepth;  // LOD depth for this chunk
-        uint32_t padding;
-    };
-    
-    std::vector<ChunkInfo> chunkInfos;
+    // Create chunk meta buffer - must match shader ChunkMeta struct
+    std::vector<ChunkMeta> chunkMetas;
     for (size_t i = 0; i < chunks.size(); ++i) {
         const auto* chunk = chunks[i];
-        const auto& aabb = chunk->getAABB();
-        ChunkInfo info;
-        info.aabbMin[0] = aabb.min.x;
-        info.aabbMin[1] = aabb.min.y;
-        info.aabbMin[2] = aabb.min.z;
-        info.aabbMin[3] = 0.0f;  // Unused
-        info.aabbMax[0] = aabb.max.x;
-        info.aabbMax[1] = aabb.max.y;
-        info.aabbMax[2] = aabb.max.z;
-        info.aabbMax[3] = voxels::CHUNK_SIZE_METERS;  // 256.0f
-        info.nodeOffset = nodeOffsets[i];
-        info.nodeCount = static_cast<uint32_t>(chunk->getSVO().getNodeCount());
-        
-        // Calculate LOD depth based on distance from camera
-        math::Vec3 chunkCenter = aabb.getCenter();
-        float distance = (chunkCenter - cameraPos).length();
-        info.maxDepth = voxels::getMaxDepthForDistance(distance);
-        
-        info.padding = 0;
-        chunkInfos.push_back(info);
+        ChunkMeta meta;
+        meta.nodeOffset = nodeOffsets[i];
+        meta.nodeCount = static_cast<uint32_t>(chunk->getTree().getNodeCount());
+        meta.maxDepth = chunk->getCurrentDepth();
+        meta.rootMaterial = chunk->getTree().getRootMaterial();
+        chunkMetas.push_back(meta);
     }
     
     // Debug: Log chunk info occasionally
@@ -901,17 +880,9 @@ void Renderer::createChunkBuffers(const std::vector<const voxels::Chunk*>& chunk
     if (debugCounter % 60 == 0 && !chunks.empty()) {
         LOG_INFO("GPU Chunk Debug: Sending " + std::to_string(chunks.size()) + " chunks, " + 
                  std::to_string(totalNodes) + " total nodes");
-        if (chunks.size() > 0) {
-            const auto* firstChunk = chunks[0];
-            LOG_INFO("First chunk: AABB min=(" + 
-                     std::to_string(chunkInfos[0].aabbMin[0]) + "," +
-                     std::to_string(chunkInfos[0].aabbMin[1]) + "," +
-                     std::to_string(chunkInfos[0].aabbMin[2]) + "), " +
-                     "nodes=" + std::to_string(chunkInfos[0].nodeCount));
-        }
     }
     
-    VkDeviceSize infoBufferSize = chunkInfos.size() * sizeof(ChunkInfo);
+    VkDeviceSize infoBufferSize = chunkMetas.size() * sizeof(ChunkMeta);
     VkBufferCreateInfo bufferInfo{};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = infoBufferSize;
@@ -939,7 +910,7 @@ void Renderer::createChunkBuffers(const std::vector<const voxels::Chunk*>& chunk
     
     void* data;
     vkMapMemory(device, chunkInfoBufferMemory, 0, infoBufferSize, 0, &data);
-    std::memcpy(data, chunkInfos.data(), infoBufferSize);
+    std::memcpy(data, chunkMetas.data(), infoBufferSize);
     vkUnmapMemory(device, chunkInfoBufferMemory);
     
     // Uniform buffer is created during initialization, just update descriptor set
@@ -962,7 +933,7 @@ void Renderer::createChunkBuffers(const std::vector<const voxels::Chunk*>& chunk
     VkDescriptorBufferInfo chunkDataBufferInfo{};
     chunkDataBufferInfo.buffer = chunkDataBuffer;
     chunkDataBufferInfo.offset = 0;
-    chunkDataBufferInfo.range = totalNodes > 0 ? totalNodes * sizeof(voxels::SVONode) : VK_WHOLE_SIZE;
+    chunkDataBufferInfo.range = totalNodes > 0 ? totalNodes * sizeof(voxels::Tree27Node) : VK_WHOLE_SIZE;
     
     descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     descriptorWrites[1].dstSet = descriptorSet;
@@ -1001,14 +972,243 @@ void Renderer::createChunkBuffers(const std::vector<const voxels::Chunk*>& chunk
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
 }
 
-void Renderer::updateUniformBuffer(const math::Vec3& cameraPos, const math::Vec3& cameraDir, const math::Vec3& cameraUp) {
+// Helper function to collect chunk data
+void Renderer::collectChunkData(const voxels::ChunkArray& chunkArray,
+                                 std::vector<voxels::Tree27Node>& allNodes,
+                                 std::vector<ChunkMeta>& chunkMetas) {
+    // Initialize all metas to empty
+    chunkMetas.resize(voxels::CHUNK_ARRAY_TOTAL);
+    for (auto& meta : chunkMetas) {
+        meta.nodeOffset = 0;
+        meta.nodeCount = 0;
+        meta.maxDepth = 0;
+        meta.rootMaterial = 0;
+    }
+    
+    allNodes.clear();
+    
+    // Iterate through all chunks in the array
+    for (uint32_t z = 0; z < voxels::CHUNK_ARRAY_SIZE; z++) {
+        for (uint32_t y = 0; y < voxels::CHUNK_ARRAY_SIZE; y++) {
+            for (uint32_t x = 0; x < voxels::CHUNK_ARRAY_SIZE; x++) {
+                uint32_t flatIdx = x + y * voxels::CHUNK_ARRAY_SIZE + z * voxels::CHUNK_ARRAY_SIZE * voxels::CHUNK_ARRAY_SIZE;
+                
+                const voxels::Chunk* chunk = chunkArray.getByIndex(x, y, z);
+                if (chunk && chunk->isLoaded()) {
+                    const auto& nodes = chunk->getTree().getNodes();
+                    
+                    chunkMetas[flatIdx].nodeOffset = static_cast<uint32_t>(allNodes.size());
+                    chunkMetas[flatIdx].nodeCount = static_cast<uint32_t>(nodes.size());
+                    chunkMetas[flatIdx].maxDepth = chunk->getCurrentDepth();
+                    chunkMetas[flatIdx].rootMaterial = chunk->getTree().getRootMaterial();
+                    
+                    // Append nodes
+                    allNodes.insert(allNodes.end(), nodes.begin(), nodes.end());
+                }
+            }
+        }
+    }
+    
+    // Ensure at least one node exists
+    if (allNodes.empty()) {
+        voxels::Tree27Node emptyNode{};
+        std::memset(&emptyNode, 0, sizeof(voxels::Tree27Node));
+        allNodes.push_back(emptyNode);
+    }
+}
+
+// New createChunkBuffers for 17x17x17 ChunkArray
+// Only creates buffers if they don't exist or are too small
+void Renderer::createChunkBuffers(const voxels::ChunkArray& chunkArray) {
+    // Collect chunk data
+    std::vector<voxels::Tree27Node> allNodes;
+    std::vector<ChunkMeta> chunkMetas;
+    collectChunkData(chunkArray, allNodes, chunkMetas);
+    
+    VkDeviceSize requiredNodeBufferSize = allNodes.size() * sizeof(voxels::Tree27Node);
+    VkDeviceSize requiredMetaBufferSize = chunkMetas.size() * sizeof(ChunkMeta);
+    
+    // Create chunk data buffer if it doesn't exist or is too small
+    if (chunkDataBuffer == VK_NULL_HANDLE || requiredNodeBufferSize > currentChunkDataBufferSize) {
+        // Destroy old buffer if it exists
+        if (chunkDataBufferMemory != VK_NULL_HANDLE) {
+            vkFreeMemory(device, chunkDataBufferMemory, nullptr);
+            chunkDataBufferMemory = VK_NULL_HANDLE;
+        }
+        if (chunkDataBuffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(device, chunkDataBuffer, nullptr);
+            chunkDataBuffer = VK_NULL_HANDLE;
+        }
+        
+        // Allocate with some headroom (1.5x) to reduce recreations
+        VkDeviceSize allocatedSize = std::max(requiredNodeBufferSize, static_cast<VkDeviceSize>(requiredNodeBufferSize * 1.5));
+        currentChunkDataBufferSize = allocatedSize;
+        
+        VkBufferCreateInfo bufferInfo{};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.size = allocatedSize;
+        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        
+        if (vkCreateBuffer(device, &bufferInfo, nullptr, &chunkDataBuffer) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create chunk data buffer");
+        }
+        
+        VkMemoryRequirements memRequirements;
+        vkGetBufferMemoryRequirements(device, chunkDataBuffer, &memRequirements);
+        
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memRequirements.size;
+        allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits,
+                                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &chunkDataBufferMemory) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate chunk data buffer memory");
+        }
+        
+        vkBindBufferMemory(device, chunkDataBuffer, chunkDataBufferMemory, 0);
+    }
+    
+    // Create chunk meta buffer if it doesn't exist (always 17^3 = 4913 entries)
+    if (chunkInfoBuffer == VK_NULL_HANDLE) {
+        VkBufferCreateInfo bufferInfo{};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.size = requiredMetaBufferSize;
+        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        
+        if (vkCreateBuffer(device, &bufferInfo, nullptr, &chunkInfoBuffer) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create chunk info buffer");
+        }
+        
+        VkMemoryRequirements memRequirements;
+        vkGetBufferMemoryRequirements(device, chunkInfoBuffer, &memRequirements);
+        
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memRequirements.size;
+        allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits,
+                                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &chunkInfoBufferMemory) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate chunk info buffer memory");
+        }
+        
+        vkBindBufferMemory(device, chunkInfoBuffer, chunkInfoBufferMemory, 0);
+    }
+    
+    // Update buffer data
+    void* data;
+    vkMapMemory(device, chunkDataBufferMemory, 0, requiredNodeBufferSize, 0, &data);
+    std::memcpy(data, allNodes.data(), requiredNodeBufferSize);
+    vkUnmapMemory(device, chunkDataBufferMemory);
+    
+    vkMapMemory(device, chunkInfoBufferMemory, 0, requiredMetaBufferSize, 0, &data);
+    std::memcpy(data, chunkMetas.data(), requiredMetaBufferSize);
+    vkUnmapMemory(device, chunkInfoBufferMemory);
+    
+    // Update descriptor set (only needed if buffers were recreated)
+    if (chunkDataBuffer != VK_NULL_HANDLE && chunkInfoBuffer != VK_NULL_HANDLE) {
+        std::vector<VkWriteDescriptorSet> descriptorWrites(4);
+        
+        VkDescriptorImageInfo imageInfo{};
+        imageInfo.imageView = storageImageView;
+        imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        
+        descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrites[0].dstSet = descriptorSet;
+        descriptorWrites[0].dstBinding = 0;
+        descriptorWrites[0].dstArrayElement = 0;
+        descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        descriptorWrites[0].descriptorCount = 1;
+        descriptorWrites[0].pImageInfo = &imageInfo;
+        
+        VkDescriptorBufferInfo chunkDataBufferInfo{};
+        chunkDataBufferInfo.buffer = chunkDataBuffer;
+        chunkDataBufferInfo.offset = 0;
+        chunkDataBufferInfo.range = VK_WHOLE_SIZE;
+        
+        descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrites[1].dstSet = descriptorSet;
+        descriptorWrites[1].dstBinding = 1;
+        descriptorWrites[1].dstArrayElement = 0;
+        descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        descriptorWrites[1].descriptorCount = 1;
+        descriptorWrites[1].pBufferInfo = &chunkDataBufferInfo;
+        
+        VkDescriptorBufferInfo chunkInfoBufferInfo{};
+        chunkInfoBufferInfo.buffer = chunkInfoBuffer;
+        chunkInfoBufferInfo.offset = 0;
+        chunkInfoBufferInfo.range = VK_WHOLE_SIZE;
+        
+        descriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrites[2].dstSet = descriptorSet;
+        descriptorWrites[2].dstBinding = 2;
+        descriptorWrites[2].dstArrayElement = 0;
+        descriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        descriptorWrites[2].descriptorCount = 1;
+        descriptorWrites[2].pBufferInfo = &chunkInfoBufferInfo;
+        
+        VkDescriptorBufferInfo uniformBufferDescriptorInfo{};
+        uniformBufferDescriptorInfo.buffer = uniformBuffer;
+        uniformBufferDescriptorInfo.offset = 0;
+        uniformBufferDescriptorInfo.range = VK_WHOLE_SIZE;
+        
+        descriptorWrites[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrites[3].dstSet = descriptorSet;
+        descriptorWrites[3].dstBinding = 3;
+        descriptorWrites[3].dstArrayElement = 0;
+        descriptorWrites[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        descriptorWrites[3].descriptorCount = 1;
+        descriptorWrites[3].pBufferInfo = &uniformBufferDescriptorInfo;
+        
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+    }
+}
+
+// Update chunk buffers in place (no recreation)
+void Renderer::updateChunkBuffers(const voxels::ChunkArray& chunkArray) {
+    // Ensure buffers exist
+    if (chunkDataBuffer == VK_NULL_HANDLE || chunkInfoBuffer == VK_NULL_HANDLE) {
+        createChunkBuffers(chunkArray);
+        return;
+    }
+    
+    // Collect chunk data
+    std::vector<voxels::Tree27Node> allNodes;
+    std::vector<ChunkMeta> chunkMetas;
+    collectChunkData(chunkArray, allNodes, chunkMetas);
+    
+    VkDeviceSize requiredNodeBufferSize = allNodes.size() * sizeof(voxels::Tree27Node);
+    VkDeviceSize requiredMetaBufferSize = chunkMetas.size() * sizeof(ChunkMeta);
+    
+    // Check if we need to grow the buffer
+    if (requiredNodeBufferSize > currentChunkDataBufferSize) {
+        // Buffer too small, need to recreate
+        createChunkBuffers(chunkArray);
+        return;
+    }
+    
+    // Update data in place
+    void* data;
+    vkMapMemory(device, chunkDataBufferMemory, 0, requiredNodeBufferSize, 0, &data);
+    std::memcpy(data, allNodes.data(), requiredNodeBufferSize);
+    vkUnmapMemory(device, chunkDataBufferMemory);
+    
+    vkMapMemory(device, chunkInfoBufferMemory, 0, requiredMetaBufferSize, 0, &data);
+    std::memcpy(data, chunkMetas.data(), requiredMetaBufferSize);
+    vkUnmapMemory(device, chunkInfoBufferMemory);
+}
+
+void Renderer::updateUniformBuffer(const math::Vec3& cameraPos, const math::Vec3& cameraDir, 
+                                    const math::Vec3& cameraUp, const math::Vec3& arrayOrigin) {
     if (uniformBufferMemory == VK_NULL_HANDLE) {
-        // Uniform buffer not created yet - this shouldn't happen, but handle gracefully
         return;
     }
     
     UniformBufferData uboData{};
-    std::memset(&uboData, 0, sizeof(UniformBufferData)); // Zero all padding
+    std::memset(&uboData, 0, sizeof(UniformBufferData));
     
     uboData.cameraPos[0] = cameraPos.x;
     uboData.cameraPos[1] = cameraPos.y;
@@ -1022,36 +1222,35 @@ void Renderer::updateUniformBuffer(const math::Vec3& cameraPos, const math::Vec3
     uboData.cameraDir[3] = 0.0f;
     
     math::Vec3 normalizedUp = cameraUp.normalize();
-    uboData.cameraUp[0] = normalizedUp.x;
-    uboData.cameraUp[1] = normalizedUp.y;
-    uboData.cameraUp[2] = normalizedUp.z;
-    uboData.cameraUp[3] = 0.0f;
     
     // Compute proper camera basis vectors
-    // Right = forward cross world_up (gives horizontal direction)
     math::Vec3 right = normalizedDir.cross(normalizedUp).normalize();
-    // Actual camera up = right cross forward (perpendicular to both)
     math::Vec3 actualUp = right.cross(normalizedDir).normalize();
     
-    uboData.cameraRight[0] = right.x;
-    uboData.cameraRight[1] = right.y;
-    uboData.cameraRight[2] = right.z;
-    uboData.cameraRight[3] = 1.0f; // FOV tangent (tan(45°) ≈ 1.0 for ~90° FOV)
+    uboData.cameraRightFov[0] = right.x;
+    uboData.cameraRightFov[1] = right.y;
+    uboData.cameraRightFov[2] = right.z;
+    uboData.cameraRightFov[3] = 1.0f; // FOV tangent
     
-    // Use actual camera up, not world up
     uboData.cameraUp[0] = actualUp.x;
     uboData.cameraUp[1] = actualUp.y;
     uboData.cameraUp[2] = actualUp.z;
+    uboData.cameraUp[3] = 0.0f;
     
-    // chunkCount is set in render() after this call
-    uboData.chunkCount = 0;
+    // Array origin for direct chunk indexing
+    uboData.arrayOrigin[0] = arrayOrigin.x;
+    uboData.arrayOrigin[1] = arrayOrigin.y;
+    uboData.arrayOrigin[2] = arrayOrigin.z;
+    uboData.arrayOrigin[3] = voxels::CHUNK_SIZE_METERS;  // 729.0f
+    
+    uboData.chunkCount = 0;  // Set in render()
+    uboData.debugMode = debugMode;
     uboData._pad1 = 0;
     uboData._pad2 = 0;
-    uboData._pad3 = 0;
     
-    // Sun direction - pointing straight up for now (can be adjusted for time of day)
+    // Sun direction
     uboData.sunDir[0] = 0.0f;
-    uboData.sunDir[1] = 1.0f;  // Up
+    uboData.sunDir[1] = 1.0f;
     uboData.sunDir[2] = 0.0f;
     uboData.sunDir[3] = 0.0f;
     
@@ -1061,6 +1260,377 @@ void Renderer::updateUniformBuffer(const math::Vec3& cameraPos, const math::Vec3
     vkUnmapMemory(device, uniformBufferMemory);
 }
 
+// ============================================================================
+// Non-blocking render using GPUChunkUpdate from ChunkManager
+// ============================================================================
+void Renderer::render(const voxels::GPUChunkUpdate* gpuUpdate,
+                     const math::Vec3& cameraPos, const math::Vec3& cameraDir,
+                     const math::Vec3& cameraUp) {
+    if (framebufferResized) {
+        recreateSwapchain();
+        framebufferResized = false;
+    }
+    
+    // Update GPU buffers if we have new data
+    if (gpuUpdate && gpuUpdate->ready) {
+        updateChunkBuffersFromUpdate(*gpuUpdate);
+        lastArrayOrigin = gpuUpdate->arrayOrigin;
+        lastChunkCount = gpuUpdate->loadedChunkCount;
+        gpuBuffersValid = true;
+    }
+    
+    // Can't render without valid buffers
+    if (!gpuBuffersValid || chunkDataBuffer == VK_NULL_HANDLE || chunkInfoBuffer == VK_NULL_HANDLE) {
+        return;
+    }
+    
+    // Update uniform buffer
+    updateUniformBuffer(cameraPos, cameraDir, cameraUp, lastArrayOrigin);
+    
+    // Update chunk count in uniform buffer
+    if (uniformBufferMemory != VK_NULL_HANDLE) {
+        void* data;
+        vkMapMemory(device, uniformBufferMemory, 0, sizeof(UniformBufferData), 0, &data);
+        UniformBufferData* uboData = static_cast<UniformBufferData*>(data);
+        uboData->chunkCount = static_cast<uint32_t>(lastChunkCount);
+        uboData->debugMode = debugMode;
+        vkUnmapMemory(device, uniformBufferMemory);
+    }
+    
+    // Update debug info
+    if (debugInfoBufferMemory != VK_NULL_HANDLE) {
+        void* data;
+        vkMapMemory(device, debugInfoBufferMemory, 0, sizeof(DebugInfo), 0, &data);
+        DebugInfo* debugInfo = static_cast<DebugInfo*>(data);
+        debugInfo->cameraPos[0] = cameraPos.x;
+        debugInfo->cameraPos[1] = cameraPos.y;
+        debugInfo->cameraPos[2] = cameraPos.z;
+        debugInfo->cameraPos[3] = 0.0f;
+        vkUnmapMemory(device, debugInfoBufferMemory);
+    }
+    
+    // Acquire swapchain image and render
+    uint32_t imageIndex;
+    VkResult result = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
+    
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        recreateSwapchain();
+        return;
+    }
+    
+    recordCommandBuffer(commandBuffers[0], imageIndex);
+    
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    VkSemaphore waitSemaphores[] = {imageAvailableSemaphore};
+    VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT};
+    submitInfo.waitSemaphoreCount = 1;
+    submitInfo.pWaitSemaphores = waitSemaphores;
+    submitInfo.pWaitDstStageMask = waitStages;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffers[0];
+    VkSemaphore signalSemaphores[] = {renderFinishedSemaphore};
+    submitInfo.signalSemaphoreCount = 1;
+    submitInfo.pSignalSemaphores = signalSemaphores;
+    
+    vkQueueSubmit(computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    
+    VkPresentInfoKHR presentInfo{};
+    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    presentInfo.waitSemaphoreCount = 1;
+    presentInfo.pWaitSemaphores = signalSemaphores;
+    VkSwapchainKHR swapchains[] = {swapchain};
+    presentInfo.swapchainCount = 1;
+    presentInfo.pSwapchains = swapchains;
+    presentInfo.pImageIndices = &imageIndex;
+    
+    result = vkQueuePresentKHR(presentQueue, &presentInfo);
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+        framebufferResized = true;
+    }
+}
+
+// ============================================================================
+// Buffer allocation and update methods
+// ============================================================================
+
+void Renderer::ensureChunkBuffersAllocated(VkDeviceSize requiredNodeSize) {
+    // Check if we need to grow the node buffer
+    if (chunkDataBuffer != VK_NULL_HANDLE && currentChunkDataBufferSize >= requiredNodeSize) {
+        return;  // Already have enough space
+    }
+    
+    // Wait for GPU to finish before reallocating
+    vkDeviceWaitIdle(device);
+    
+    // Destroy old buffers
+    if (chunkDataBufferMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(device, chunkDataBufferMemory, nullptr);
+        chunkDataBufferMemory = VK_NULL_HANDLE;
+    }
+    if (chunkDataBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device, chunkDataBuffer, nullptr);
+        chunkDataBuffer = VK_NULL_HANDLE;
+    }
+    
+    // Allocate with 2x headroom to reduce future reallocations
+    VkDeviceSize allocSize = std::max(requiredNodeSize * 2, INITIAL_NODE_BUFFER_SIZE);
+    
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = allocSize;
+    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    
+    if (vkCreateBuffer(device, &bufferInfo, nullptr, &chunkDataBuffer) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create chunk data buffer");
+    }
+    
+    VkMemoryRequirements memRequirements;
+    vkGetBufferMemoryRequirements(device, chunkDataBuffer, &memRequirements);
+    
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits,
+                                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &chunkDataBufferMemory) != VK_SUCCESS) {
+        throw std::runtime_error("failed to allocate chunk data buffer memory");
+    }
+    
+    vkBindBufferMemory(device, chunkDataBuffer, chunkDataBufferMemory, 0);
+    currentChunkDataBufferSize = allocSize;
+    
+    LOG_INFO("Allocated chunk data buffer: " + std::to_string(allocSize / (1024 * 1024)) + " MB");
+    
+    // Also ensure meta buffer exists
+    if (chunkInfoBuffer == VK_NULL_HANDLE) {
+        bufferInfo.size = META_BUFFER_SIZE;
+        
+        if (vkCreateBuffer(device, &bufferInfo, nullptr, &chunkInfoBuffer) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create chunk info buffer");
+        }
+        
+        vkGetBufferMemoryRequirements(device, chunkInfoBuffer, &memRequirements);
+        allocInfo.allocationSize = memRequirements.size;
+        allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits,
+                                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &chunkInfoBufferMemory) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate chunk info buffer memory");
+        }
+        
+        vkBindBufferMemory(device, chunkInfoBuffer, chunkInfoBufferMemory, 0);
+        currentChunkMetaBufferSize = META_BUFFER_SIZE;
+    }
+    
+    // Update descriptor set with new buffers
+    std::vector<VkWriteDescriptorSet> descriptorWrites(4);
+    
+    VkDescriptorImageInfo imageInfo{};
+    imageInfo.imageView = storageImageView;
+    imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    
+    descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    descriptorWrites[0].dstSet = descriptorSet;
+    descriptorWrites[0].dstBinding = 0;
+    descriptorWrites[0].dstArrayElement = 0;
+    descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    descriptorWrites[0].descriptorCount = 1;
+    descriptorWrites[0].pImageInfo = &imageInfo;
+    
+    VkDescriptorBufferInfo chunkDataInfo{};
+    chunkDataInfo.buffer = chunkDataBuffer;
+    chunkDataInfo.offset = 0;
+    chunkDataInfo.range = VK_WHOLE_SIZE;
+    
+    descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    descriptorWrites[1].dstSet = descriptorSet;
+    descriptorWrites[1].dstBinding = 1;
+    descriptorWrites[1].dstArrayElement = 0;
+    descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    descriptorWrites[1].descriptorCount = 1;
+    descriptorWrites[1].pBufferInfo = &chunkDataInfo;
+    
+    VkDescriptorBufferInfo chunkInfoInfo{};
+    chunkInfoInfo.buffer = chunkInfoBuffer;
+    chunkInfoInfo.offset = 0;
+    chunkInfoInfo.range = VK_WHOLE_SIZE;
+    
+    descriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    descriptorWrites[2].dstSet = descriptorSet;
+    descriptorWrites[2].dstBinding = 2;
+    descriptorWrites[2].dstArrayElement = 0;
+    descriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    descriptorWrites[2].descriptorCount = 1;
+    descriptorWrites[2].pBufferInfo = &chunkInfoInfo;
+    
+    VkDescriptorBufferInfo uniformInfo{};
+    uniformInfo.buffer = uniformBuffer;
+    uniformInfo.offset = 0;
+    uniformInfo.range = sizeof(UniformBufferData);
+    
+    descriptorWrites[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    descriptorWrites[3].dstSet = descriptorSet;
+    descriptorWrites[3].dstBinding = 3;
+    descriptorWrites[3].dstArrayElement = 0;
+    descriptorWrites[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    descriptorWrites[3].descriptorCount = 1;
+    descriptorWrites[3].pBufferInfo = &uniformInfo;
+    
+    vkUpdateDescriptorSets(device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+}
+
+void Renderer::updateChunkBuffersFromUpdate(const voxels::GPUChunkUpdate& update) {
+    // Calculate required size
+    VkDeviceSize requiredNodeSize = update.nodes.size() * sizeof(voxels::Tree27Node);
+    VkDeviceSize requiredMetaSize = update.metas.size() * sizeof(ChunkMeta);
+    
+    // Ensure buffers are allocated and large enough
+    ensureChunkBuffersAllocated(requiredNodeSize);
+    
+    // Update node data (fast memcpy, no allocation)
+    if (!update.nodes.empty()) {
+        void* data;
+        vkMapMemory(device, chunkDataBufferMemory, 0, requiredNodeSize, 0, &data);
+        std::memcpy(data, update.nodes.data(), requiredNodeSize);
+        vkUnmapMemory(device, chunkDataBufferMemory);
+    }
+    
+    // Update meta data
+    // Convert GPUChunkMeta to ChunkMeta (they should be compatible)
+    if (!update.metas.empty()) {
+        void* data;
+        vkMapMemory(device, chunkInfoBufferMemory, 0, requiredMetaSize, 0, &data);
+        
+        // Direct copy since GPUChunkMeta and ChunkMeta have same layout
+        static_assert(sizeof(voxels::GPUChunkMeta) == sizeof(ChunkMeta), "GPUChunkMeta and ChunkMeta must have same size");
+        std::memcpy(data, update.metas.data(), requiredMetaSize);
+        
+        vkUnmapMemory(device, chunkInfoBufferMemory);
+    }
+    
+    lastTotalNodes = update.nodes.size();
+}
+
+// Legacy chunk array based render
+void Renderer::render(const voxels::ChunkArray& chunkArray,
+                     const math::Vec3& cameraPos, const math::Vec3& cameraDir,
+                     const math::Vec3& cameraUp) {
+    if (framebufferResized) {
+        recreateSwapchain();
+        framebufferResized = false;
+    }
+    
+    // Get array origin for shader
+    math::Vec3 arrayOrigin = chunkArray.getArrayOrigin();
+    
+    // Always count nodes to check if buffer needs updating
+    size_t totalNodes = 0;
+    size_t loadedCount = 0;
+    
+    for (uint32_t z = 0; z < voxels::CHUNK_ARRAY_SIZE; z++) {
+        for (uint32_t y = 0; y < voxels::CHUNK_ARRAY_SIZE; y++) {
+            for (uint32_t x = 0; x < voxels::CHUNK_ARRAY_SIZE; x++) {
+                const voxels::Chunk* chunk = chunkArray.getByIndex(x, y, z);
+                if (chunk && chunk->isLoaded()) {
+                    totalNodes += chunk->getTree().getNodeCount();
+                    loadedCount++;
+                }
+            }
+        }
+    }
+    
+    // Check if buffer needs updating:
+    // 1. Array origin changed (player moved to new chunk) - requires full recreation
+    // 2. Buffers don't exist - need to create
+    // 3. Otherwise - just update in place
+    bool arrayOriginChanged = (arrayOrigin.x != lastArrayOrigin.x || 
+                               arrayOrigin.y != lastArrayOrigin.y || 
+                               arrayOrigin.z != lastArrayOrigin.z);
+    bool buffersNeedCreation = (chunkDataBuffer == VK_NULL_HANDLE || chunkInfoBuffer == VK_NULL_HANDLE);
+    
+    if (arrayOriginChanged || buffersNeedCreation || (lastChunkCount == 0 && loadedCount > 0)) {
+        // Full recreation needed (origin changed or first time)
+        createChunkBuffers(chunkArray);
+        lastChunkCount = loadedCount;
+        lastTotalNodes = totalNodes;
+        lastArrayOrigin = arrayOrigin;
+    } else if (loadedCount != lastChunkCount || totalNodes != lastTotalNodes) {
+        // Data changed but buffers exist - update in place
+        updateChunkBuffers(chunkArray);
+        lastChunkCount = loadedCount;
+        lastTotalNodes = totalNodes;
+    }
+    
+    // Update uniform buffer
+    updateUniformBuffer(cameraPos, cameraDir, cameraUp, arrayOrigin);
+    
+    // Update chunk count in uniform buffer
+    if (uniformBufferMemory != VK_NULL_HANDLE) {
+        void* data;
+        vkMapMemory(device, uniformBufferMemory, 0, sizeof(UniformBufferData), 0, &data);
+        UniformBufferData* uboData = static_cast<UniformBufferData*>(data);
+        uboData->chunkCount = static_cast<uint32_t>(loadedCount);
+        uboData->debugMode = debugMode;
+        vkUnmapMemory(device, uniformBufferMemory);
+    }
+    
+    // Update debug info
+    if (debugInfoBufferMemory != VK_NULL_HANDLE) {
+        void* data;
+        vkMapMemory(device, debugInfoBufferMemory, 0, sizeof(DebugInfo), 0, &data);
+        DebugInfo* debugInfo = static_cast<DebugInfo*>(data);
+        debugInfo->cameraPos[0] = cameraPos.x;
+        debugInfo->cameraPos[1] = cameraPos.y;
+        debugInfo->cameraPos[2] = cameraPos.z;
+        debugInfo->cameraPos[3] = 0.0f;
+        vkUnmapMemory(device, debugInfoBufferMemory);
+    }
+    
+    // Acquire swapchain image and render (same as legacy)
+    uint32_t imageIndex;
+    VkResult result = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
+    
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        recreateSwapchain();
+        return;
+    }
+    
+    recordCommandBuffer(commandBuffers[0], imageIndex);
+    
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    VkSemaphore waitSemaphores[] = {imageAvailableSemaphore};
+    VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT};
+    submitInfo.waitSemaphoreCount = 1;
+    submitInfo.pWaitSemaphores = waitSemaphores;
+    submitInfo.pWaitDstStageMask = waitStages;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffers[0];
+    VkSemaphore signalSemaphores[] = {renderFinishedSemaphore};
+    submitInfo.signalSemaphoreCount = 1;
+    submitInfo.pSignalSemaphores = signalSemaphores;
+    
+    vkQueueSubmit(computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    
+    VkPresentInfoKHR presentInfo{};
+    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    presentInfo.waitSemaphoreCount = 1;
+    presentInfo.pWaitSemaphores = signalSemaphores;
+    VkSwapchainKHR swapchains[] = {swapchain};
+    presentInfo.swapchainCount = 1;
+    presentInfo.pSwapchains = swapchains;
+    presentInfo.pImageIndices = &imageIndex;
+    
+    result = vkQueuePresentKHR(presentQueue, &presentInfo);
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+        framebufferResized = true;
+    }
+}
+
+// Legacy render with chunk list
 void Renderer::render(const std::vector<const voxels::Chunk*>& chunks, 
                      const math::Vec3& cameraPos, const math::Vec3& cameraDir,
                      const math::Vec3& cameraUp) {
@@ -1069,28 +1639,30 @@ void Renderer::render(const std::vector<const voxels::Chunk*>& chunks,
         framebufferResized = false;
     }
     
-    // CRITICAL: Wait for GPU to finish before modifying any buffers
-    // This prevents race conditions where we destroy buffers the GPU is still using
-    vkDeviceWaitIdle(device);
-    
-    // Only recreate chunk buffers if chunks have changed
-    static size_t lastChunkCount = 0;
-    static size_t lastTotalNodes = 0;
-    size_t totalNodes = 0;
-    for (const auto* chunk : chunks) {
-        totalNodes += chunk->getSVO().getNodeCount();
+    // Calculate array origin from first chunk (legacy mode)
+    math::Vec3 arrayOrigin(0, 0, 0);
+    if (!chunks.empty()) {
+        arrayOrigin = chunks[0]->getWorldPosition();
     }
     
-    if (chunks.size() != lastChunkCount || totalNodes != lastTotalNodes) {
+    size_t totalNodes = 0;
+    for (const auto* chunk : chunks) {
+        totalNodes += chunk->getTree().getNodeCount();
+    }
+    
+    // Only recreate if significant change (avoid constant recreation)
+    bool significantChange = (chunks.size() != lastChunkCount) ||
+                             (lastTotalNodes > 0 && (totalNodes > lastTotalNodes * 1.2f || totalNodes < lastTotalNodes * 0.8f));
+    
+    if (significantChange) {
+        // Don't wait for GPU - semaphores handle synchronization
         createChunkBuffers(chunks, cameraPos);
         lastChunkCount = chunks.size();
         lastTotalNodes = totalNodes;
     }
     
-    // Update uniform buffer (camera data changes every frame)
-    updateUniformBuffer(cameraPos, cameraDir, cameraUp);
+    updateUniformBuffer(cameraPos, cameraDir, cameraUp, arrayOrigin);
     
-    // Update uniform buffer chunk count
     if (uniformBufferMemory != VK_NULL_HANDLE) {
         void* data;
         vkMapMemory(device, uniformBufferMemory, 0, sizeof(UniformBufferData), 0, &data);

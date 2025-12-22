@@ -1,6 +1,8 @@
 #include "../engine/graphics/renderer.h"
 #include "../engine/voxels/chunk_manager.h"
-#include "../engine/voxels/chunk.h"  // For ChunkCoordHash
+#include "../engine/voxels/chunk.h"
+#include "../engine/voxels/chunk_array.h"
+#include "../engine/voxels/world_constants.h"
 #include "../engine/networking/network.h"
 #include "../game/world/world_generator.h"
 #include "../engine/math/vec3.h"
@@ -45,28 +47,23 @@ int main() {
         LOG_WARNING("Failed to initialize network - running in single player mode");
     }
     
-    // Track which chunks we've already requested to avoid duplicate requests
+    // Track which chunks we've already requested
     std::unordered_set<chonk::voxels::ChunkCoord, chonk::voxels::ChunkCoordHash> requestedChunks;
     
     // Set up network callbacks
-    network.onChunkReceived = [&chunkManager, &requestedChunks](const chonk::voxels::ChunkCoord& coord, const std::vector<uint8_t>& data) {
-        // Deserialize and add chunk to chunk manager
-        chunkManager.addChunkFromNetwork(coord, data);
-        // Remove from requested set since we received it
+    network.onChunkReceived = [&chunkManager, &requestedChunks](const chonk::voxels::ChunkCoord& coord, const std::vector<uint8_t>& data, uint32_t depth) {
+        chunkManager.addChunkFromNetwork(coord, data, depth);
         requestedChunks.erase(coord);
     };
     
-    // Player position - spawn at terrain level (grass is at y=5488, spawn slightly above at y=5490)
-    // World coordinates: floats in meters, can be negative
-    // Chunk coordinates: int32_t, calculated as floor(worldPos / chunkSize)
-    // For RES_0_25M chunks (16m size): chunk y = floor(5490 / 16) = 343
-    chonk::math::Vec3 playerPos(0, 5125, 0); // Start at terrain level
+    // Player position - spawn at terrain level (ground level at half world height)
+    chonk::math::Vec3 playerPos(0, chonk::voxels::GROUND_LEVEL + 50.0f, 0);
     
     // Camera rotation (yaw and pitch in radians)
-    float yaw = 0.0f;      // Horizontal rotation (around Y axis)
-    float pitch = -0.2f;   // Vertical rotation (slightly down to see ground)
+    float yaw = 0.0f;
+    float pitch = -0.2f;  // Slightly looking down
     
-    // Calculate initial camera direction from yaw and pitch
+    // Calculate camera direction from yaw and pitch
     auto updateCameraDir = [&yaw, &pitch]() -> chonk::math::Vec3 {
         chonk::math::Vec3 dir;
         dir.x = std::cos(pitch) * std::sin(yaw);
@@ -84,17 +81,19 @@ int main() {
     double lastMouseY = 0.0;
     bool firstMouse = true;
     const float mouseSensitivity = 0.002f;
-    const float maxPitch = 1.57f; // ~90 degrees
+    const float maxPitch = 1.57f;
     
-    // Set up mouse callbacks
+    // Capture mouse
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
     mouseCaptured = true;
     glfwGetCursorPos(window, &lastMouseX, &lastMouseY);
     
     auto lastTime = std::chrono::steady_clock::now();
-    
-    // Update counter for player position logging
     int updateCounter = 0;
+    
+    // Debug mode toggle
+    uint32_t debugMode = 0;  // 0=normal, 1=LOD colors, 2=chunk grid
+    bool debugKeyPressed = false;
     
     // Main loop
     while (!glfwWindowShouldClose(window)) {
@@ -109,10 +108,20 @@ int main() {
                 glfwGetCursorPos(window, &lastMouseX, &lastMouseY);
                 firstMouse = true;
             }
-            // Wait for key release to avoid toggling multiple times
             while (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
                 glfwPollEvents();
             }
+        }
+        
+        // Toggle debug mode with F1
+        if (glfwGetKey(window, GLFW_KEY_F1) == GLFW_PRESS) {
+            if (!debugKeyPressed) {
+                debugMode = (debugMode + 1) % 3;
+                renderer.setDebugMode(debugMode);
+                debugKeyPressed = true;
+            }
+        } else {
+            debugKeyPressed = false;
         }
         
         // Handle mouse look
@@ -132,11 +141,9 @@ int main() {
             yaw += static_cast<float>(deltaX) * mouseSensitivity;
             pitch -= static_cast<float>(deltaY) * mouseSensitivity;
             
-            // Clamp pitch to prevent flipping
             if (pitch > maxPitch) pitch = maxPitch;
             if (pitch < -maxPitch) pitch = -maxPitch;
             
-            // Update camera direction
             cameraDir = updateCameraDir();
             
             lastMouseX = mouseX;
@@ -147,12 +154,12 @@ int main() {
         float deltaTime = std::chrono::duration<float>(currentTime - lastTime).count();
         lastTime = currentTime;
         
-        // Simple camera movement (WASD + QE for up/down)
-        // Check if Shift is held for 10x speed boost
+        // Movement speed (with shift boost)
         float speedMultiplier = (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS || 
-                                 glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) ? 10.0f : 1.0f;
-        float moveSpeed = 10.0f * deltaTime * speedMultiplier;
+                                 glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) ? 50.0f : 1.0f;
+        float moveSpeed = 20.0f * deltaTime * speedMultiplier;
         
+        // WASD movement
         if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
             playerPos = playerPos + cameraDir * moveSpeed;
         }
@@ -174,16 +181,16 @@ int main() {
             playerPos = playerPos - cameraUp * moveSpeed;
         }
         
-        // Log player position every 1000 updates
+        // Log position occasionally
         updateCounter++;
         if (updateCounter % 1000 == 0) {
-            LOG_INFO("Player position: (" + 
-                     std::to_string(playerPos.x) + ", " +
-                     std::to_string(playerPos.y) + ", " +
-                     std::to_string(playerPos.z) + ")");
+            LOG_INFO("Player pos: (" + 
+                     std::to_string((int)playerPos.x) + ", " +
+                     std::to_string((int)playerPos.y) + ", " +
+                     std::to_string((int)playerPos.z) + ")");
         }
         
-        // Update chunk manager (frame-based for LOD caching)
+        // Update chunk manager (non-blocking, queues work for background threads)
         static uint32_t frameCounter = 0;
         frameCounter++;
         chunkManager.update(playerPos, frameCounter);
@@ -191,17 +198,10 @@ int main() {
         // Update network
         network.update();
         
-        // Get chunks for rendering (frustum culled with LOD)
-        float fov = 0.5f; // Field of view
-        auto visibleChunks = chunkManager.getAllLoadedChunks();
-        
-        // Debug: Print chunk count occasionally (every 1000 updates)
+        // Debug info
         if (updateCounter % 1000 == 0) {
             LOG_INFO("Loaded: " + std::to_string(chunkManager.getLoadedChunkCount()) + 
-                     " chunks, " + std::to_string(chunkManager.getLoadedSuperChunkCount()) +
-                     " super, Visible (non-air): " + std::to_string(visibleChunks.size()) +
-                     ", Pending: " + std::to_string(chunkManager.getPendingLoadCount()) +
-                     " load, " + std::to_string(chunkManager.getPendingRefineCount()) + " refine");
+                     " chunks, Pending: " + std::to_string(chunkManager.getPendingLoadCount()));
         }
         
         // Calculate FPS
@@ -220,24 +220,31 @@ int main() {
         std::vector<std::string> debugTexts;
         std::vector<std::pair<int, int>> debugPositions;
         
-        // Position text
         debugTexts.push_back("pos " + std::to_string((int)playerPos.x) + ", " + 
                             std::to_string((int)playerPos.y) + ", " + 
                             std::to_string((int)playerPos.z));
         debugPositions.push_back({10, 10});
         
-        // FPS text
         debugTexts.push_back("fps " + std::to_string((int)fps));
         debugPositions.push_back({10, 40});
+        
+        std::string modeStr = debugMode == 0 ? "normal" : (debugMode == 1 ? "lod" : "grid");
+        debugTexts.push_back("f1 mode, " + modeStr);
+        debugPositions.push_back({10, 70});
         
         renderer.setDebugText(debugTexts, debugPositions);
         renderer.setDebugInfo(fps, true, true, 2.0f);
         
-        // Render only visible chunks
-        renderer.render(visibleChunks, playerPos, cameraDir, cameraUp);
+        // Get GPU update from chunk manager (non-blocking)
+        // This returns the latest prepared chunk data without waiting
+        const chonk::voxels::GPUChunkUpdate* gpuUpdate = chunkManager.getGPUUpdate();
         
-        // Send player position to server
-        if (network.isServer() == false) {
+        // Render using non-blocking GPU update path
+        // Movement is never blocked - we render with whatever data is ready
+        renderer.render(gpuUpdate, playerPos, cameraDir, cameraUp);
+        
+        // Send position to server
+        if (!network.isServer()) {
             network.sendPlayerPosition(playerPos);
         }
     }
@@ -251,4 +258,3 @@ int main() {
     
     return 0;
 }
-

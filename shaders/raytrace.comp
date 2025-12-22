@@ -1,102 +1,109 @@
 #version 450
 
 // ============================================================================
-// SVO Node structure - must match C++ struct layout
+// 27-ary Tree Node Structure (matches C++ Tree27Node - 12 bytes)
 // ============================================================================
-struct SVONode {
-    uint childBase;      // First 4 bytes
-    uint packedData;     // childMask (byte 0), material (byte 1), leafBlockIndex (bytes 2-3)
+// Layout: firstChildIndex (4) + childMask (4) + majorityMaterial (1) + fillPercent (1) + pad (2) = 12 bytes
+
+struct Tree27Node {
+    uint firstChildIndex;
+    uint childMask;       // bits 0-26: children, bits 27-31: flags
+    uint packedData;      // majorityMaterial (byte 0), fillPercent (byte 1), pad (bytes 2-3)
 };
 
-uint getChildMask(SVONode node) {
-    return node.packedData & 0xFFu;
-}
+// Flag constants (match C++)
+const uint FLAG_HAS_MORE_DETAIL = (1u << 27);
+const uint FLAG_IS_LEAF         = (1u << 28);
+const uint FLAG_IS_AIR          = (1u << 29);
+const uint CHILD_MASK_BITS      = 0x07FFFFFFu;
 
-uint getMaterial(SVONode node) {
-    return (node.packedData >> 8) & 0xFFu;
+// Node accessors
+uint getMaterial(Tree27Node node) { return node.packedData & 0xFFu; }
+uint getFillPercent(Tree27Node node) { return (node.packedData >> 8) & 0xFFu; }
+bool hasChild(Tree27Node node, uint idx) { return (node.childMask & (1u << idx)) != 0; }
+bool isLeaf(Tree27Node node) { return (node.childMask & CHILD_MASK_BITS) == 0u || (node.childMask & FLAG_IS_LEAF) != 0u; }
+bool isAir(Tree27Node node) { return (node.childMask & FLAG_IS_AIR) != 0u; }
+
+// Count set bits before position (for child offset calculation)
+uint getChildOffset(uint childMask, uint childIdx) {
+    uint mask = (1u << childIdx) - 1u;
+    return bitCount(childMask & mask & CHILD_MASK_BITS);
 }
 
 // ============================================================================
-// Chunk info - contains AABB and LOD info
+// Chunk Metadata (for 17x17x17 array)
 // ============================================================================
-struct ChunkInfo {
-    vec4 aabbMin;      // xyz = min, w = unused
-    vec4 aabbMax;      // xyz = max, w = chunk size (256m)
-    uint nodeOffset;
-    uint nodeCount;
-    uint maxDepth;     // LOD depth limit based on distance
-    uint padding;
+struct ChunkMeta {
+    uint nodeOffset;      // Start index in global node array
+    uint nodeCount;       // Number of nodes for this chunk
+    uint maxDepth;        // LOD depth limit
+    uint rootMaterial;    // For quick air check (0 = air)
 };
 
+// ============================================================================
+// Bindings
+// ============================================================================
 layout(set = 0, binding = 0, rgba8) uniform writeonly image2D outputImage;
-layout(set = 0, binding = 1) readonly buffer ChunkDataBuffer {
-    SVONode nodes[];
-} chunkData;
 
-layout(set = 0, binding = 2) readonly buffer ChunkInfoBuffer {
-    ChunkInfo chunks[];
-} chunkInfo;
+layout(set = 0, binding = 1) readonly buffer NodeBuffer {
+    Tree27Node nodes[];
+} nodeBuffer;
+
+layout(set = 0, binding = 2) readonly buffer ChunkMetaBuffer {
+    ChunkMeta chunks[4913];  // 17^3
+} chunkMeta;
 
 layout(set = 0, binding = 3) uniform UniformBuffer {
-    vec4 cameraPosV4;     // xyz = position
-    vec4 cameraDirV4;     // xyz = direction
-    vec4 cameraUpV4;      // xyz = up vector
-    vec4 cameraRightFov;  // xyz = right vector, w = fov
-    uint chunkCount;
+    vec4 cameraPos;          // xyz = position
+    vec4 cameraDir;          // xyz = direction
+    vec4 cameraUp;           // xyz = up vector
+    vec4 cameraRightFov;     // xyz = right, w = fov
+    vec4 arrayOrigin;        // xyz = world pos of chunk[0,0,0], w = chunk size (729)
+    vec4 sunDir;             // xyz = sun direction
+    uint chunkCount;         // Number of loaded chunks (for debug)
+    uint debugMode;          // 0 = normal, 1 = LOD colors, 2 = chunk grid
     uint _pad1;
     uint _pad2;
-    uint _pad3;
-    vec4 sunDirV4;        // xyz = sun direction
 } ubo;
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 // ============================================================================
-// Material colors
+// Constants
+// ============================================================================
+const float CHUNK_SIZE = 729.0;
+const uint ARRAY_SIZE = 17u;
+const uint ARRAY_CENTER = 8u;
+const float EPSILON = 0.001;
+const float STEP_EPSILON = 1e-6;  // Small epsilon for boundary crossing
+
+// ============================================================================
+// Material Colors
 // ============================================================================
 vec3 getMaterialColor(uint material) {
-    if (material == 1u) return vec3(0.2, 0.8, 0.2);  // Grass - green
-    if (material == 2u) return vec3(0.6, 0.4, 0.2);  // Dirt - brown
-    if (material == 3u) return vec3(0.5, 0.5, 0.5);  // Stone - grey
-    return vec3(1.0, 0.0, 1.0);                      // Unknown - magenta
+    if (material == 0u) return vec3(0.0);                   // Air (shouldn't render)
+    if (material == 1u) return vec3(0.3, 0.7, 0.2);         // Grass - green
+    if (material == 2u) return vec3(0.55, 0.35, 0.2);       // Dirt - brown
+    if (material == 3u) return vec3(0.5, 0.5, 0.55);        // Stone - grey
+    return vec3(1.0, 0.0, 1.0);                              // Unknown - magenta
+}
+
+// LOD debug colors (based on depth)
+vec3 getLODColor(uint depth) {
+    if (depth >= 7u) return vec3(0.2, 1.0, 0.2);   // Full detail - bright green
+    if (depth == 6u) return vec3(0.4, 0.9, 0.4);
+    if (depth == 5u) return vec3(0.6, 0.8, 0.3);
+    if (depth == 4u) return vec3(0.8, 0.7, 0.2);
+    if (depth == 3u) return vec3(1.0, 0.6, 0.1);
+    if (depth == 2u) return vec3(1.0, 0.4, 0.1);
+    if (depth == 1u) return vec3(1.0, 0.2, 0.1);
+    return vec3(1.0, 0.0, 0.0);                     // Root only - red
 }
 
 // ============================================================================
-// Debug visualization - chunk colors by distance/LOD
+// Ray-AABB Intersection
 // ============================================================================
-vec3 getChunkDebugTint(vec3 aabbMin, float chunkSize, uint maxDepth) {
-    // Checkerboard pattern
-    ivec3 chunkCoord = ivec3(floor(aabbMin / chunkSize));
-    int checker = (chunkCoord.x + chunkCoord.y + chunkCoord.z) & 1;
-    
-    // Color based on LOD depth (8 = full detail, 1 = root only)
-    vec3 lodColor;
-    if (maxDepth >= 8u) {
-        lodColor = checker == 0 ? vec3(0.9, 1.0, 1.0) : vec3(0.7, 0.9, 0.95);
-    } else if (maxDepth == 7u) {
-        lodColor = checker == 0 ? vec3(0.7, 0.85, 1.0) : vec3(0.5, 0.7, 0.9);
-    } else if (maxDepth == 6u) {
-        lodColor = checker == 0 ? vec3(0.5, 0.7, 1.0) : vec3(0.3, 0.5, 0.85);
-    } else if (maxDepth == 5u) {
-        lodColor = checker == 0 ? vec3(0.7, 0.5, 1.0) : vec3(0.55, 0.35, 0.85);
-    } else if (maxDepth == 4u) {
-        lodColor = checker == 0 ? vec3(1.0, 0.5, 0.9) : vec3(0.85, 0.35, 0.75);
-    } else if (maxDepth == 3u) {
-        lodColor = checker == 0 ? vec3(1.0, 0.5, 0.6) : vec3(0.85, 0.35, 0.45);
-    } else if (maxDepth == 2u) {
-        lodColor = checker == 0 ? vec3(1.0, 0.7, 0.4) : vec3(0.9, 0.55, 0.25);
-    } else {
-        lodColor = checker == 0 ? vec3(1.0, 0.9, 0.4) : vec3(0.9, 0.8, 0.25);
-    }
-    
-    return lodColor;
-}
-
-// ============================================================================
-// Ray-AABB intersection
-// ============================================================================
-bool intersectAABB(vec3 origin, vec3 dir, vec3 aabbMin, vec3 aabbMax, out float tmin, out float tmax) {
-    vec3 invDir = 1.0 / dir;
+bool intersectAABB(vec3 origin, vec3 invDir, vec3 aabbMin, vec3 aabbMax, out float tmin, out float tmax) {
     vec3 t0 = (aabbMin - origin) * invDir;
     vec3 t1 = (aabbMax - origin) * invDir;
     vec3 tsmall = min(t0, t1);
@@ -107,67 +114,88 @@ bool intersectAABB(vec3 origin, vec3 dir, vec3 aabbMin, vec3 aabbMax, out float 
 }
 
 // ============================================================================
-// Stackless SVO traversal with LOD depth limit
+// Compute 27-ary child index from local position
 // ============================================================================
-uint findMaterialInSVO(uint nodeOffset, uint nodeCount, vec3 localPos, float chunkSize, uint maxDepth) {
-    if (nodeCount == 0u || nodeOffset >= chunkData.nodes.length()) {
-        return 0u;
-    }
+uint getChildIndex27(vec3 localPos, float nodeSize, out vec3 childLocalPos) {
+    float third = nodeSize / 3.0;
     
-    uint nodeIdx = nodeOffset;
-    vec3 nodeMin = vec3(0.0);
-    float nodeSize = chunkSize;
+    // Calculate which third we're in (0, 1, or 2) using floor
+    vec3 f = localPos / third;
+    uvec3 idx = min(uvec3(2), uvec3(floor(max(vec3(0.0), f))));
     
-    for (uint depth = 0u; depth <= maxDepth && depth < 16u; depth++) {
-        if (nodeIdx >= nodeOffset + nodeCount) {
-            return 0u;
-        }
-        
-        SVONode node = chunkData.nodes[nodeIdx];
-        uint childMask = getChildMask(node);
-        uint material = getMaterial(node);
-        
-        // If leaf node or at max depth, return material
-        if (childMask == 0u || depth == maxDepth) {
-            return material;
-        }
-        
-        // Find which child octant contains the point
-        float childSize = nodeSize * 0.5;
-        
-        uint childIdx = 0u;
-        vec3 childMin = nodeMin;
-        
-        if (localPos.x >= nodeMin.x + childSize) {
-            childIdx |= 1u;
-            childMin.x += childSize;
-        }
-        if (localPos.y >= nodeMin.y + childSize) {
-            childIdx |= 2u;
-            childMin.y += childSize;
-        }
-        if (localPos.z >= nodeMin.z + childSize) {
-            childIdx |= 4u;
-            childMin.z += childSize;
-        }
-        
-        // Check if this child exists
-        if ((childMask & (1u << childIdx)) == 0u) {
-            // Child doesn't exist - use parent's dominant material
-            return material;
-        }
-        
-        // Move to child
-        nodeIdx = nodeOffset + node.childBase + childIdx;
-        nodeMin = childMin;
-        nodeSize = childSize;
-    }
+    // Calculate position within the child
+    childLocalPos = localPos - vec3(idx) * third;
     
-    return 0u;
+    // Child index: x + y*3 + z*9 (0-26)
+    return idx.x + idx.y * 3u + idx.z * 9u;
 }
 
 // ============================================================================
-// Main ray tracing kernel
+// Traverse 27-ary tree to find material at position
+// ============================================================================
+uint traverseTree27(uint nodeOffset, uint nodeCount, vec3 localPos, float treeSize, uint maxDepth) {
+    if (nodeCount == 0u) return 0u;
+    
+    // Clamp input to valid range [0, treeSize)
+    vec3 pos = clamp(localPos, vec3(0.0), vec3(treeSize - 0.001));
+    
+    uint nodeIdx = nodeOffset;
+    float nodeSize = treeSize;
+    
+    for (uint depth = 0u; depth <= maxDepth && depth < 16u; depth++) {
+        if (nodeIdx >= nodeOffset + nodeCount) return 0u;
+        
+        Tree27Node node = nodeBuffer.nodes[nodeIdx];
+        
+        // If leaf or at max depth, return material
+        if (isLeaf(node) || depth == maxDepth) {
+            return getMaterial(node);
+        }
+        
+        // Find which child contains this position
+        vec3 childPos;
+        uint childIdx = getChildIndex27(pos, nodeSize, childPos);
+        
+        // Clamp child local position to valid range
+        float childSize = nodeSize / 3.0;
+        childPos = clamp(childPos, vec3(0.0), vec3(childSize - 0.001));
+        
+        // Check if child exists
+        if (!hasChild(node, childIdx)) {
+            return getMaterial(node);
+        }
+        
+        // Move to child
+        uint childOffset = getChildOffset(node.childMask, childIdx);
+        nodeIdx = node.firstChildIndex + childOffset;
+        nodeSize = childSize;
+        pos = childPos;
+    }
+    
+    return getMaterial(nodeBuffer.nodes[nodeIdx]);
+}
+
+// ============================================================================
+// Direct chunk lookup from world position
+// ============================================================================
+bool getChunkIndex(vec3 worldPos, out uvec3 chunkIdx) {
+    vec3 localArrayPos = worldPos - ubo.arrayOrigin.xyz;
+    vec3 idx = floor(localArrayPos / CHUNK_SIZE);
+    
+    if (any(lessThan(idx, vec3(0.0))) || any(greaterThanEqual(idx, vec3(float(ARRAY_SIZE))))) {
+        return false;
+    }
+    
+    chunkIdx = uvec3(idx);
+    return true;
+}
+
+uint flatChunkIndex(uvec3 idx) {
+    return idx.x + idx.y * ARRAY_SIZE + idx.z * ARRAY_SIZE * ARRAY_SIZE;
+}
+
+// ============================================================================
+// Main Ray Marching Kernel
 // ============================================================================
 void main() {
     ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
@@ -180,74 +208,140 @@ void main() {
     // Calculate ray direction
     vec2 uv = (vec2(pixelCoord) + 0.5) / vec2(imageSize);
     uv = uv * 2.0 - 1.0;
+    uv.y *= -float(imageSize.y) / float(imageSize.x);
     
-    float aspectRatio = float(imageSize.x) / float(imageSize.y);
-    uv.y /= aspectRatio;
-    uv.y *= -1.0;
+    vec3 rayOrigin = ubo.cameraPos.xyz;
+    vec3 rayDir = normalize(
+        ubo.cameraDir.xyz + 
+        ubo.cameraRightFov.xyz * uv.x * ubo.cameraRightFov.w +
+        ubo.cameraUp.xyz * uv.y * ubo.cameraRightFov.w
+    );
+    vec3 invDir = 1.0 / rayDir;
     
-    vec3 cameraPos = ubo.cameraPosV4.xyz;
-    vec3 cameraDir = ubo.cameraDirV4.xyz;
-    vec3 cameraUp = ubo.cameraUpV4.xyz;
-    vec3 cameraRight = ubo.cameraRightFov.xyz;
-    float fov = ubo.cameraRightFov.w;
+    // Array bounds
+    vec3 arrayMin = ubo.arrayOrigin.xyz;
+    vec3 arrayMax = arrayMin + vec3(float(ARRAY_SIZE)) * CHUNK_SIZE;
     
-    vec3 rayDir = normalize(cameraDir + cameraRight * uv.x * fov + cameraUp * uv.y * fov);
-    vec3 rayOrigin = cameraPos;
+    // Check if ray intersects array bounds
+    float tmin, tmax;
+    if (!intersectAABB(rayOrigin, invDir, arrayMin, arrayMax, tmin, tmax)) {
+        // Sky color
+        imageStore(outputImage, pixelCoord, vec4(0.4, 0.6, 0.9, 1.0));
+        return;
+    }
     
-    // Find closest chunk intersection
-    float closestT = 1e10;
-    uint hitChunkIdx = 0xFFFFFFFFu;
+    // Start point
+    float t = max(tmin, 0.0);
+    vec3 pos = rayOrigin + rayDir * t;
     
-    for (uint i = 0u; i < ubo.chunkCount && i < 10000u; i++) {
-        vec3 aabbMin = chunkInfo.chunks[i].aabbMin.xyz;
-        vec3 aabbMax = chunkInfo.chunks[i].aabbMax.xyz;
-        
-        float tmin, tmax;
-        if (intersectAABB(rayOrigin, rayDir, aabbMin, aabbMax, tmin, tmax)) {
-            if (tmin < closestT && tmax > 0.0) {
-                closestT = max(tmin, 0.0);
-                hitChunkIdx = i;
+    // DDA setup for chunk traversal
+    vec3 deltaDist = abs(vec3(CHUNK_SIZE) / rayDir);
+    ivec3 rayStep = ivec3(sign(rayDir));
+    
+    // Current chunk
+    ivec3 currentChunk;
+    uvec3 uCurrentChunk;
+    if (!getChunkIndex(pos, uCurrentChunk)) {
+        imageStore(outputImage, pixelCoord, vec4(0.4, 0.6, 0.9, 1.0));
+        return;
+    }
+    currentChunk = ivec3(uCurrentChunk);
+    
+    // Parametric distance to next chunk boundary (DDA setup)
+    vec3 chunkMin = ubo.arrayOrigin.xyz + vec3(uvec3(currentChunk)) * CHUNK_SIZE;
+    vec3 chunkMax = chunkMin + CHUNK_SIZE;
+    vec3 tMax;
+    tMax.x = (rayStep.x > 0) ? (chunkMax.x - pos.x) * abs(invDir.x) : (pos.x - chunkMin.x) * abs(invDir.x);
+    tMax.y = (rayStep.y > 0) ? (chunkMax.y - pos.y) * abs(invDir.y) : (pos.y - chunkMin.y) * abs(invDir.y);
+    tMax.z = (rayStep.z > 0) ? (chunkMax.z - pos.z) * abs(invDir.z) : (pos.z - chunkMin.z) * abs(invDir.z);
+    
+    // March through chunks using DDA
+    vec3 finalColor = vec3(0.4, 0.6, 0.9);  // Sky default
+    
+    for (int i = 0; i <= 50; i++) {  // Max 50 chunk traversals
+
+        // Check bounds first
+        if (any(lessThan(currentChunk, ivec3(0))) || any(greaterThanEqual(currentChunk, ivec3(ARRAY_SIZE)))) {
+            break;
+        }
+
+        uint flatIdx = flatChunkIndex(uvec3(currentChunk));
+        ChunkMeta meta = chunkMeta.chunks[flatIdx];
+
+        // Quick skip for air chunks
+        if (meta.rootMaterial != 0u && meta.nodeCount > 0u) {
+            // Calculate local position within chunk
+            vec3 chunkOrigin = ubo.arrayOrigin.xyz + vec3(uvec3(currentChunk)) * CHUNK_SIZE;
+            vec3 localPos = pos - chunkOrigin;
+
+            // Traverse tree to find material (tree handles bounds checking internally)
+            uint material = traverseTree27(meta.nodeOffset, meta.nodeCount, localPos, CHUNK_SIZE, meta.maxDepth);
+
+            if (material != 0u) {
+                // Hit solid voxel!
+                vec3 matColor = getMaterialColor(material);
+
+                // Debug: LOD visualization
+                if (ubo.debugMode == 1u) {
+                    vec3 lodColor = getLODColor(meta.maxDepth);
+                    matColor = mix(matColor, lodColor, 0.5);
+                }
+
+                // Debug: Chunk grid
+                if (ubo.debugMode == 2u) {
+                    // Calculate grid position relative to chunk origin (0-1 within chunk)
+                    vec3 gridPos = localPos / CHUNK_SIZE;
+
+                    // Draw lines at chunk boundaries (near 0.0 and 1.0)
+                    float gridLine = 0.0;
+                    float threshold = 0.01;  // Line thickness
+
+                    // Check if near any boundary
+                    if (gridPos.x < threshold || gridPos.x > (1.0 - threshold) ||
+                        gridPos.y < threshold || gridPos.y > (1.0 - threshold) ||
+                        gridPos.z < threshold || gridPos.z > (1.0 - threshold)) {
+                        gridLine = 1.0;
+                    }
+
+                    matColor = mix(matColor, vec3(1.0, 0.0, 0.0), gridLine * 0.8);
+                }
+
+                // Simple lighting
+                vec3 sunDir = normalize(ubo.sunDir.xyz);
+                float light = max(dot(vec3(0.0, 1.0, 0.0), sunDir), 0.0);
+                finalColor = matColor * (0.4 + 0.6 * light);
+
+
+                break;
             }
         }
-    }
-    
-    // Default sky color
-    vec3 color = vec3(0.4, 0.6, 0.9);
-    
-    if (hitChunkIdx != 0xFFFFFFFFu) {
-        ChunkInfo chunk = chunkInfo.chunks[hitChunkIdx];
-        vec3 aabbMin = chunk.aabbMin.xyz;
-        float chunkSize = chunk.aabbMax.w;
-        uint maxDepth = chunk.maxDepth;
         
-        // Step into chunk
-        float stepSize = chunkSize / float(1u << maxDepth) * 0.1;
-        vec3 hitPoint = rayOrigin + rayDir * (closestT + stepSize);
-        
-        // Convert to chunk-local coordinates
-        vec3 localPos = hitPoint - aabbMin;
-        localPos = clamp(localPos, vec3(0.001), vec3(chunkSize - 0.001));
-        
-        // Find material in SVO with LOD
-        uint material = findMaterialInSVO(chunk.nodeOffset, chunk.nodeCount, localPos, chunkSize, maxDepth);
-        
-        if (material != 0u) {
-            vec3 materialColor = getMaterialColor(material);
-            
-            // Debug: blend with chunk tint
-            vec3 chunkTint = getChunkDebugTint(aabbMin, chunkSize, maxDepth);
-            color = mix(materialColor, chunkTint, 0.4);
-            
-            // Lighting
-            vec3 sunDir = normalize(ubo.sunDirV4.xyz);
-            float light = max(dot(vec3(0.0, 1.0, 0.0), sunDir), 0.0);
-            color = color * (0.4 + 0.6 * light);
+        // Step to next chunk (DDA)
+        float stepT;
+        if (tMax.x < tMax.y && tMax.x < tMax.z) {
+            stepT = max(tMax.x, 1e-4);  // Minimum step to prevent infinite loops
+            pos += rayDir * (stepT + STEP_EPSILON);
+            tMax.x += deltaDist.x;
+            currentChunk.x += rayStep.x;
+        } else if (tMax.y < tMax.z) {
+            stepT = max(tMax.y, 1e-4);  // Minimum step to prevent infinite loops
+            pos += rayDir * (stepT + STEP_EPSILON);
+            tMax.y += deltaDist.y;
+            currentChunk.y += rayStep.y;
         } else {
-            // Air region
-            vec3 chunkTint = getChunkDebugTint(aabbMin, chunkSize, maxDepth);
-            color = chunkTint * 0.3;
+            stepT = max(tMax.z, 1e-4);  // Minimum step to prevent infinite loops
+            pos += rayDir * (stepT + STEP_EPSILON);
+            tMax.z += deltaDist.z;
+            currentChunk.z += rayStep.z;
         }
+
+        // Recalculate tMax after stepping to avoid accumulated precision errors
+        vec3 chunkMinNew = ubo.arrayOrigin.xyz + vec3(uvec3(currentChunk)) * CHUNK_SIZE;
+        vec3 chunkMaxNew = chunkMinNew + CHUNK_SIZE;
+        tMax.x = max((rayStep.x > 0) ? (chunkMaxNew.x - pos.x) * abs(invDir.x) : (pos.x - chunkMinNew.x) * abs(invDir.x), 0.0);
+        tMax.y = max((rayStep.y > 0) ? (chunkMaxNew.y - pos.y) * abs(invDir.y) : (pos.y - chunkMinNew.y) * abs(invDir.y), 0.0);
+        tMax.z = max((rayStep.z > 0) ? (chunkMaxNew.z - pos.z) * abs(invDir.z) : (pos.z - chunkMinNew.z) * abs(invDir.z), 0.0);
     }
     
-    imageStore(outputImage, pixelCoord, vec4(color, 1.0));
+    imageStore(outputImage, pixelCoord, vec4(finalColor, 1.0));
 }
