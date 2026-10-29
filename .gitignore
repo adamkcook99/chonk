@@ -1,2 +1,15 @@
+# Build artifacts
 build/
 .cache/
+examples/*/build/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Chunk save data (generated at runtime)
+chunks/
